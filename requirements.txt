@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+pillow-heif
+rembg
+onnxruntime
+firebase-admin
+google-cloud-vision
+openai==0.28.1
