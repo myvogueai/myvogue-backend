@@ -1207,7 +1207,7 @@ async def genera_outfit(
     # === Parametri opzionali retro-compatibili (Punto 2) ===
     maxOutfits: int = Query(3, ge=1, le=3),   # premium: quanti outfit provare a restituire
     compact: bool = Query(False),             # se True, payload alleggerito
-    noAI: bool = Query(False),                # forza fallback manuale (utile per test/latenza)
+    noAI: bool = Query(True),                 # forza fallback manuale (utile per test/latenza)
     preferColors: str = Query("", description="comma-separated, e.g. 'blu,beige'"),
     excludeIds: str = Query("", description="comma-separated item ids to avoid"),
     refreshSeed: str = Query("", description="seed opzionale per refresh deterministico"),
