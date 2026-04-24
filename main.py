@@ -1498,10 +1498,27 @@ async def genera_outfit(
                 except Exception:
                     pass
 
-            # GPT sceglie il migliore tra i candidati già validi.
-            # Non sostituisce la logica locale: decide solo il vincitore finale.
-            # GPT disattivato temporaneamente per stabilizzare /outfit su Render.
-            # Manteniamo solo il ranking locale già calcolato da outfit_score(...).
+            # GPT come giudice finale: sceglie solo tra i migliori candidati locali (max 5).
+            if not noAI:
+                print("GPT judge enabled")
+                picked_outfit = _ai_pick_best_candidate(
+                    topK[:5], stile_l_req, stagione_l, lang_name
+                )
+                if picked_outfit and _is_valid_outfit(picked_outfit):
+                    sig_pick = _sig(picked_outfit)
+                    idx_match = next(
+                        (i for i, c in enumerate(topK) if _sig(c["outfit"]) == sig_pick),
+                        None,
+                    )
+                    if idx_match is not None:
+                        topK = [topK[idx_match]] + [
+                            c for i, c in enumerate(topK) if i != idx_match
+                        ]
+                        print("GPT judge selected candidate")
+                    else:
+                        print("GPT judge fallback to local ranking")
+                else:
+                    print("GPT judge fallback to local ranking")
 
             outfits_payload = []
             for idx, c in enumerate(topK):
