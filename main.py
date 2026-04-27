@@ -387,6 +387,50 @@ def are_compatible(c1, c2):
     return c2 in BASIC_COLORS.get(c1, []) or c1 in BASIC_COLORS.get(c2, [])
 
 
+def color_relation_score(c1, c2):
+    """Score di armonia tra due colori in [-1, +1]."""
+    _LOCAL_CANON = {"cognac": "marrone", "viola": "lilla"}
+
+    def _canon(c):
+        if not c:
+            return normalize_color(c)
+        raw = str(c).strip().lower()
+        if raw in _LOCAL_CANON:
+            return _LOCAL_CANON[raw]
+        return normalize_color(c)
+
+    n1, n2 = _canon(c1), _canon(c2)
+    if n1 == "sconosciuto" or n2 == "sconosciuto":
+        return 0.2
+    if n1 == n2:
+        return 1.0
+
+    if {n1, n2} == {"rosso", "verde"}:
+        return -1.0
+    if {n1, n2} == {"giallo", "lilla"}:
+        return -0.65
+
+    neutrals = {"nero", "bianco", "grigio", "beige", "avorio", "multicolore"}
+    earth = {"marrone"}
+    navy_blue_gray = {"blu", "azzurro", "grigio"}
+    if (n1 in earth and n2 in navy_blue_gray) or (n2 in earth and n1 in navy_blue_gray):
+        return 0.9
+
+    if n1 in neutrals and n2 in neutrals:
+        return 0.35
+    if n1 in neutrals or n2 in neutrals:
+        return 0.55
+
+    strong = {
+        "rosso", "verde", "giallo", "arancione", "bordeaux",
+        "lilla", "rosa", "senape",
+    }
+    if n1 in strong and n2 in strong:
+        return -0.5
+
+    return 0.2
+
+
 def _norm_text(value):
     return str(value or "").strip().lower()
 
@@ -715,6 +759,710 @@ def _score_base_item_fit(
             score += 1.0
 
     return score
+
+
+NEUTRALS = {"bianco", "nero", "grigio", "navy", "beige"}
+EARTH = {"marrone", "cognac", "cuoio"}
+STRONG = {"rosso", "giallo", "fucsia", "arancione"}
+
+
+def color_relation_score(c1, c2) -> float:
+    r1 = str(c1 or "").strip().lower()
+    r2 = str(c2 or "").strip().lower()
+    t1 = normalize_color(c1)
+    t2 = normalize_color(c2)
+
+    def neutral_side(t: str, raw: str) -> int:
+        if "navy" in raw or t == "blu":
+            return 1
+        if t in NEUTRALS:
+            return 1
+        return 0
+
+    def earth_side(t: str, raw: str) -> int:
+        if t == "marrone":
+            return 1
+        if "cognac" in raw or "cuoio" in raw:
+            return 1
+        return 0
+
+    def cool_elegant_side(t: str, raw: str) -> int:
+        if t in ("blu", "grigio"):
+            return 1
+        if "navy" in raw:
+            return 1
+        return 0
+
+    def strong_side(t: str, raw: str) -> int:
+        if t in ("rosso", "giallo", "arancione"):
+            return 1
+        if "fucsia" in raw or "magenta" in raw:
+            return 1
+        if t == "fucsia":
+            return 1
+        return 0
+
+    def bright_green_side(t: str, raw: str) -> int:
+        if t != "verde":
+            return 0
+        if any(k in raw for k in ("acceso", "fluo", "fluoresc", "lime", "neon", "smeraldo")):
+            return 1
+        return 0
+
+    def bright_purple_side(t: str, raw: str) -> int:
+        if "fucsia" in raw or "magenta" in raw:
+            return 1
+        if "viola" in raw and any(k in raw for k in ("acceso", "fluo", "neon", "elett")):
+            return 1
+        return 0
+
+    def same_color_family(ta: str, ra: str, tb: str, rb: str) -> bool:
+        if ta == tb:
+            return False
+        if ta in ("blu", "azzurro") and tb in ("blu", "azzurro"):
+            return True
+        ea = ta == "marrone" or "cognac" in ra or "cuoio" in ra
+        eb = tb == "marrone" or "cognac" in rb or "cuoio" in rb
+        if ea and eb:
+            return True
+        if ta in ("verde", "oliva") and tb in ("verde", "oliva"):
+            return True
+        if ta in ("rosso", "bordeaux") and tb in ("rosso", "bordeaux"):
+            return True
+        return False
+
+    if t1 == "sconosciuto" or t2 == "sconosciuto":
+        return 0.2
+
+    if t1 == t2:
+        return 0.65
+
+    if same_color_family(t1, r1, t2, r2):
+        return 0.75
+
+    if (t1 == "nero" and "navy" in r2) or (t2 == "nero" and "navy" in r1):
+        return 0.1
+
+    if (t1 == "rosso" and t2 == "verde") or (t2 == "rosso" and t1 == "verde"):
+        if (t1 == "verde" and bright_green_side(t1, r1)) or (t2 == "verde" and bright_green_side(t2, r2)):
+            return -1.0
+        return -0.5
+
+    if (t1 == "giallo" and bright_purple_side(t2, r2)) or (t2 == "giallo" and bright_purple_side(t1, r1)):
+        return -0.65
+
+    if strong_side(t1, r1) and strong_side(t2, r2):
+        return -0.2
+
+    if (earth_side(t1, r1) and cool_elegant_side(t2, r2)) or (
+        earth_side(t2, r2) and cool_elegant_side(t1, r1)
+    ):
+        return 0.9
+
+    if neutral_side(t1, r1) and neutral_side(t2, r2):
+        return 0.5
+
+    if neutral_side(t1, r1) or neutral_side(t2, r2):
+        return 0.7
+
+    return 0.2
+
+
+def palette_score(items) -> float:
+    """Equilibrio cromatico globale outfit in [-1, 1]; morbido, indipendente dalle coppie."""
+    if not items or not isinstance(items, list):
+        return 0.0
+
+    norm_list: list[tuple[str, str]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        raw = it.get("colore")
+        if raw is None:
+            continue
+        if isinstance(raw, str) and not raw.strip():
+            continue
+        n = normalize_color(raw)
+        if not n or n == "sconosciuto":
+            continue
+        norm_list.append((str(raw).strip().lower(), n))
+
+    if len(norm_list) < 2:
+        return 0.0
+
+    def is_neutral(t: str, raw: str) -> bool:
+        if "navy" in raw or t == "blu":
+            return True
+        if t in ("nero", "bianco", "grigio", "beige", "avorio", "azzurro"):
+            return True
+        return False
+
+    def is_earth(t: str, raw: str) -> bool:
+        return t == "marrone" or "cognac" in raw or "cuoio" in raw
+
+    def is_bright_green(t: str, raw: str) -> bool:
+        if t != "verde":
+            return False
+        return any(k in raw for k in ("acceso", "fluo", "fluoresc", "lime", "neon", "smeraldo"))
+
+    def is_strong(t: str, raw: str) -> bool:
+        if t in ("rosso", "giallo", "arancione", "fucsia"):
+            return True
+        if "fucsia" in raw or "magenta" in raw:
+            return True
+        if is_bright_green(t, raw):
+            return True
+        return False
+
+    def tono_su_tono_pair(ra: str, ta: str, rb: str, tb: str) -> bool:
+        if ta == tb:
+            return True
+        if ta in ("blu", "azzurro") and tb in ("blu", "azzurro"):
+            return True
+        ea = ta == "marrone" or "cognac" in ra or "cuoio" in ra
+        eb = tb == "marrone" or "cognac" in rb or "cuoio" in rb
+        if ea and eb:
+            return True
+        if ta in ("verde", "oliva") and tb in ("verde", "oliva"):
+            return True
+        if ta in ("rosso", "bordeaux") and tb in ("rosso", "bordeaux"):
+            return True
+        return False
+
+    mc = ne = ea = st = ot = 0
+    family_tags: list[str] = []
+    for raw, t in norm_list:
+        if t == "multicolore":
+            mc += 1
+            family_tags.append("mc")
+        elif is_strong(t, raw):
+            st += 1
+            family_tags.append("strong")
+        elif is_earth(t, raw):
+            ea += 1
+            family_tags.append("earth")
+        elif is_neutral(t, raw):
+            ne += 1
+            family_tags.append("neutral")
+        else:
+            ot += 1
+            family_tags.append("other")
+
+    n_items = len(norm_list)
+    unique_norms = {t for _, t in norm_list}
+    n_families = len(set(family_tags))
+
+    score = 0.0
+
+    if len(unique_norms) == 1:
+        score += 0.28
+    elif len(unique_norms) == 2:
+        u = list(unique_norms)
+        reps: dict[str, str] = {}
+        for raw, t in norm_list:
+            if t not in reps:
+                reps[t] = raw
+        ra, rb = reps[u[0]], reps[u[1]]
+        if tono_su_tono_pair(ra, u[0], rb, u[1]):
+            score += 0.22
+
+    if st == 1 and (ne + ea) >= 1:
+        score += 0.32
+    if ne >= 1 and ea >= 1 and st == 0:
+        score += 0.2
+    if st == 0 and mc == 0 and ea == 0 and ot == 0 and ne == n_items:
+        score += 0.12
+    if mc >= 1 and st == 0:
+        score += 0.05
+
+    if st >= 2:
+        score -= 0.12
+    if n_families > 3:
+        score -= 0.14
+    if mc >= 1 and st >= 1:
+        score -= 0.1
+
+    return max(-1.0, min(1.0, score))
+
+
+def shoes_score(bottom, shoes, layer=None, target_style=None) -> float:
+    """Quanto le scarpe aiutano o ostacolano l'outfit, in [-1, 1] (contributo morbido)."""
+    if shoes is None or not isinstance(shoes, dict):
+        return 0.0
+
+    def _has_color_val(c) -> bool:
+        if c is None:
+            return False
+        if isinstance(c, str) and not str(c).strip():
+            return False
+        return True
+
+    def _raw(c) -> str:
+        return str(c or "").strip().lower()
+
+    s_col = shoes.get("colore")
+    b_col = bottom.get("colore") if bottom is not None and isinstance(bottom, dict) else None
+    l_col = layer.get("colore") if layer is not None and isinstance(layer, dict) else None
+
+    rs = _raw(s_col)
+    rb = _raw(b_col)
+    rl = _raw(l_col)
+
+    tb = (
+        normalize_color(b_col)
+        if bottom is not None and isinstance(bottom, dict) and _has_color_val(b_col)
+        else None
+    )
+    ts = normalize_color(s_col) if _has_color_val(s_col) else None
+    tl = (
+        normalize_color(l_col)
+        if layer is not None and isinstance(layer, dict) and _has_color_val(l_col)
+        else None
+    )
+    if tb == "sconosciuto":
+        tb = None
+    if ts == "sconosciuto":
+        ts = None
+    if tl == "sconosciuto":
+        tl = None
+
+    blob = " ".join(
+        [
+            _norm_text(shoes.get("nome")),
+            _norm_text(shoes.get("categoria")),
+            _norm_text(shoes.get("stile")),
+        ]
+    )
+
+    score = 0.0
+
+    if (
+        bottom is not None
+        and isinstance(bottom, dict)
+        and _has_color_val(b_col)
+        and _has_color_val(s_col)
+    ):
+        bc = normalize_color(b_col)
+        sc = normalize_color(s_col)
+        if bc != "sconosciuto" and sc != "sconosciuto":
+            score += color_relation_score(b_col, s_col) * 0.18
+
+    def _earth_shoe(t: str | None, r: str) -> bool:
+        return t == "marrone" or "cognac" in r or "cuoio" in r
+
+    def _cool_bottom(t: str | None, r: str) -> bool:
+        if "navy" in r or "denim" in r:
+            return True
+        return t in ("blu", "grigio")
+
+    if ts is not None and tb is not None and _earth_shoe(ts, rs) and _cool_bottom(tb, rb):
+        score += 0.08
+
+    if ts == "bianco" and tb is not None:
+        if tb in ("blu", "grigio", "nero") or "denim" in rb or "navy" in rb:
+            score += 0.07
+
+    if ts == "nero" and tb is not None:
+        if tb in ("nero", "grigio", "blu") or "navy" in rb:
+            score += 0.07
+
+    def _loud_color(t: str | None, r: str) -> bool:
+        if t in ("rosso", "giallo", "arancione", "fucsia"):
+            return True
+        if "fucsia" in r or "magenta" in r:
+            return True
+        if t == "verde" and any(
+            k in r for k in ("acceso", "fluo", "fluoresc", "lime", "neon", "smeraldo")
+        ):
+            return True
+        return False
+
+    if ts is not None and tb is not None and _loud_color(ts, rs) and _loud_color(tb, rb):
+        score -= 0.08
+
+    if ts is not None and tl is not None and ts == tl:
+        score += 0.05
+
+    tgt = normalize_stile(target_style)
+
+    def _has_kw(*words: str) -> bool:
+        return any(w in blob for w in words)
+
+    if tgt == "elegante":
+        if _has_kw("mocassino", "mocassin", "derby", "oxford", "loafer", "loafers"):
+            score += 0.08
+        if _has_kw(
+            "tacco",
+            "tacchi",
+            "décolleté",
+            "decollete",
+            "pump",
+            "pumps",
+            "slingback",
+            "sandalo elegante",
+            "sandali eleganti",
+        ):
+            score += 0.08
+        if _has_kw("stival", "stivale", "stivaletto") and not _has_kw(
+            "combat", "moto", "biker"
+        ):
+            score += 0.06
+        if _has_kw("sneaker", "sneakers", "running", "trainer", "basket", "tennis"):
+            score -= 0.06
+    elif tgt == "streetwear":
+        if _has_kw("sneaker", "sneakers", "dunk", "jordan", "yeezy", "skate"):
+            score += 0.09
+        if _has_kw("mocassino", "oxford", "derby", "loafer") and not _has_kw(
+            "sneaker", "sneakers"
+        ):
+            score -= 0.06
+    elif tgt == "sportivo":
+        if _has_kw(
+            "sneaker",
+            "sneakers",
+            "running",
+            "trainer",
+            "sport",
+            "sportiv",
+            "ginnastica",
+        ):
+            score += 0.08
+        if _has_kw("oxford", "derby", "mocassino", "elegante", "tacco"):
+            score -= 0.07
+    elif tgt == "casual":
+        if _has_kw("sneaker", "sneakers", "stivalett", "chelsea", "mocassino"):
+            score += 0.05
+
+    if abs(score) < 0.02:
+        if _has_color_val(s_col) and _has_color_val(b_col) and bottom is not None:
+            bc = normalize_color(b_col)
+            sc = normalize_color(s_col)
+            if bc != "sconosciuto" and sc != "sconosciuto":
+                score = color_relation_score(b_col, s_col) * 0.12
+        elif _has_color_val(s_col) and ts is not None:
+            score = 0.03
+
+    return max(-1.0, min(1.0, score))
+
+
+def style_score(items, target_style=None) -> float:
+    """Coerenza stilistica dell'outfit in [-1, 1]; contributo morbido."""
+    if not items or not isinstance(items, list):
+        return 0.0
+
+    item_texts: list[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        n = _norm_text(it.get("nome"))
+        c = _norm_text(it.get("categoria"))
+        s = normalize_stile(it.get("stile"))
+        t = " ".join(x for x in (n, c, s) if x).strip()
+        if t:
+            item_texts.append(t)
+
+    if not item_texts:
+        return 0.0
+
+    big = " ".join(item_texts)
+
+    def _hit(text: str, kws: tuple[str, ...]) -> bool:
+        return any(k in text for k in kws)
+
+    def _count_items(kws: tuple[str, ...]) -> int:
+        return sum(1 for t in item_texts if _hit(t, kws))
+
+    def _blazer_elegant(t: str) -> bool:
+        return "blazer" in t and (
+            "elegante" in t or "cerimonia" in t or "sartoria" in t or "formale" in t
+        )
+
+    street_bonus = (
+        "sneaker",
+        "sneakers",
+        "hoodie",
+        "felpa",
+        "oversize",
+        "cargo",
+        "denim",
+        "bomber",
+        "puffer",
+        "street",
+        "skate",
+    )
+    street_pen = (
+        "oxford",
+        "derby",
+        "mocassino",
+        "décolleté",
+        "decolleté",
+        "decollete",
+        "tacco elegante",
+        "pumps",
+        "pump",
+        "slingback",
+    )
+    eleg_bonus = (
+        "blazer",
+        "camicia",
+        "mocassino",
+        "oxford",
+        "derby",
+        "tacco",
+        "décolleté",
+        "decolleté",
+        "decollete",
+        "pump",
+        "pumps",
+        "slingback",
+        "abito",
+        "vestito",
+        "trench",
+        "cappotto",
+    )
+    eleg_pen = (
+        "hoodie",
+        "felpa",
+        "cargo",
+        "running",
+        "gym",
+        "sportivo",
+        "basket",
+        "skate",
+    )
+    casual_bonus = (
+        "jeans",
+        "denim",
+        "t-shirt",
+        "t shirt",
+        "maglietta",
+        "camicia semplice",
+        "sneaker",
+        "sneakers",
+        "stivalett",
+        "cardigan",
+        "maglione",
+        "chino",
+        "chinos",
+    )
+    sport_bonus = (
+        "sneaker",
+        "sneakers",
+        "running",
+        "gym",
+        "tuta",
+        "leggings",
+        "felpa",
+        "hoodie",
+        "sportivo",
+        "tecnico",
+        "trainer",
+        "ginnastica",
+    )
+    sport_pen = (
+        "oxford",
+        "derby",
+        "mocassino",
+        "décolleté",
+        "decolleté",
+        "decollete",
+        "tacco",
+        "pump",
+        "pumps",
+        "slingback",
+    )
+
+    formal_items = sum(
+        1
+        for t in item_texts
+        if _hit(t, ("oxford", "derby", "mocassino", "abito", "vestito", "trench"))
+        or _blazer_elegant(t)
+        or "décolleté" in t
+        or "decolleté" in t
+        or "decollete" in t
+        or ("tacco" in t and "elegante" in t)
+    )
+    street_sport_items = sum(
+        1
+        for t in item_texts
+        if _hit(
+            t,
+            ("hoodie", "felpa", "running", "gym", "basket", "skate", "street", "cargo"),
+        )
+        or _hit(t, ("sneaker", "sneakers"))
+    )
+
+    tgt = normalize_stile(target_style)
+    score = 0.0
+
+    if formal_items >= 1 and street_sport_items >= 1:
+        score -= 0.08
+    if formal_items >= 2 and street_sport_items >= 2:
+        score -= 0.05
+
+    if tgt == "streetwear":
+        if _hit(big, street_bonus):
+            score += 0.1
+        if _hit(big, street_pen) or any(_blazer_elegant(t) for t in item_texts):
+            score -= 0.08
+        if _count_items(street_bonus) >= 2:
+            score += 0.08
+    elif tgt == "elegante":
+        if _hit(big, eleg_bonus) or "pantalone elegante" in big:
+            score += 0.11
+        if _hit(big, eleg_pen):
+            score -= 0.09
+        coh = 0
+        for t in item_texts:
+            if _hit(t, eleg_bonus) or "pantalone elegante" in t or _blazer_elegant(t):
+                coh += 1
+        if coh >= 2:
+            score += 0.08
+    elif tgt == "casual":
+        if _hit(big, casual_bonus):
+            score += 0.07
+        too_sport = _hit(big, ("running", "gym", "tuta", "leggings", "tecnico"))
+        too_form = _hit(big, ("oxford", "abito", "vestito", "décolleté", "decollete")) or any(
+            _blazer_elegant(t) for t in item_texts
+        )
+        if too_sport or too_form:
+            score -= 0.06
+        if _count_items(casual_bonus) >= 2:
+            score += 0.06
+    elif tgt == "sportivo":
+        if _hit(big, sport_bonus):
+            score += 0.1
+        pen = _hit(big, sport_pen) or any(_blazer_elegant(t) for t in item_texts)
+        if pen:
+            score -= 0.09
+        if _count_items(sport_bonus) >= 2:
+            score += 0.08
+    else:
+        if formal_items == 0 and street_sport_items == 0:
+            score += 0.04
+
+    return max(-1.0, min(1.0, score))
+
+
+def outfit_score_v2(
+    top=None,
+    bottom=None,
+    shoes=None,
+    layer=None,
+    piece=None,
+    target_style=None,
+    base_item=None,
+    prefer_palette=None,
+) -> float:
+    """Score outfit con media pesata di colore, palette, scarpe e stile; base_item riservato al futuro."""
+    _ = base_item
+
+    if piece is not None:
+        items = [x for x in (piece, shoes, layer) if x is not None]
+    else:
+        items = [x for x in (top, bottom, shoes, layer) if x is not None]
+
+    if not items:
+        return 0.0
+
+    def _has_col(it) -> bool:
+        if not it or not isinstance(it, dict):
+            return False
+        c = it.get("colore")
+        if c is None:
+            return False
+        if isinstance(c, str) and not str(c).strip():
+            return False
+        return True
+
+    def _pair_rel(a, b, acc: list[float]) -> None:
+        if not _has_col(a) or not _has_col(b):
+            return
+        acc.append(color_relation_score(a.get("colore"), b.get("colore")))
+
+    rel_vals: list[float] = []
+    rel_no_layer: list[float] = []
+
+    if piece is None:
+        _pair_rel(top, bottom, rel_vals)
+        _pair_rel(bottom, shoes, rel_vals)
+        _pair_rel(top, shoes, rel_vals)
+        _pair_rel(layer, bottom, rel_vals)
+        _pair_rel(layer, shoes, rel_vals)
+        _pair_rel(top, bottom, rel_no_layer)
+        _pair_rel(bottom, shoes, rel_no_layer)
+        _pair_rel(top, shoes, rel_no_layer)
+    else:
+        _pair_rel(piece, shoes, rel_vals)
+        _pair_rel(piece, layer, rel_vals)
+        _pair_rel(layer, shoes, rel_vals)
+        _pair_rel(piece, shoes, rel_no_layer)
+
+    color_score = (
+        sum(rel_vals) / len(rel_vals) if rel_vals else 0.0
+    )
+    color_score = max(-1.0, min(1.0, color_score))
+
+    palette = palette_score(items)
+    shoe = shoes_score(
+        bottom if piece is None else piece,
+        shoes,
+        layer,
+        target_style,
+    )
+    style = style_score(items, target_style)
+
+    final = (
+        color_score * 0.35
+        + palette * 0.25
+        + shoe * 0.20
+        + style * 0.20
+    )
+
+    if style < -0.5:
+        final *= 0.5
+    if palette < -0.5:
+        final *= 0.7
+
+    layer_bonus = 0.0
+    if layer is not None and layer in items:
+        items_nl = [x for x in items if x is not layer]
+        pal_full = palette
+        pal_nl = palette_score(items_nl) if items_nl else 0.0
+        if pal_full > pal_nl + 0.02:
+            layer_bonus += min(0.03, (pal_full - pal_nl) * 0.6)
+        if rel_no_layer:
+            color_nl = sum(rel_no_layer) / len(rel_no_layer)
+            if color_score > color_nl + 0.02:
+                layer_bonus += min(0.03, (color_score - color_nl) * 0.6)
+        layer_bonus = min(0.05, layer_bonus)
+        final += layer_bonus
+
+    prefer_bonus = 0.0
+    if prefer_palette:
+        prefs: set[str] = set()
+        for p in prefer_palette:
+            if p is None:
+                continue
+            if isinstance(p, str) and not p.strip():
+                continue
+            nc = normalize_color(p if isinstance(p, str) else str(p))
+            if nc and nc != "sconosciuto":
+                prefs.add(nc)
+        if prefs:
+            match_n = 0
+            for it in items:
+                if not _has_col(it):
+                    continue
+                ic = normalize_color(it.get("colore"))
+                if ic != "sconosciuto" and ic in prefs:
+                    match_n += 1
+            if match_n > 0:
+                prefer_bonus = min(0.05, 0.02 * match_n)
+
+    final += prefer_bonus
+
+    return max(-1.0, min(1.0, final))
 
 
 def outfit_score(
@@ -2269,13 +3017,14 @@ async def quickpair(
                     compat_s = [s for s in scarpe if are_compatible(b.get("colore"), s.get("colore"))] or scarpe
                     sh = rnd.choice(compat_s)
 
-                    sc = outfit_score(
+                    sc = outfit_score_v2(
                         top=t,
                         bottom=b,
                         shoes=sh,
                         layer=base,
                         target_style=stile_l,
-                        base_item=base
+                        base_item=base,
+                        prefer_palette=None
                     )
 
                     _upd(
@@ -2294,12 +3043,13 @@ async def quickpair(
                 compat_s = [s for s in scarpe if are_compatible(p.get("colore"), s.get("colore"))] or scarpe
                 sh = rnd.choice(compat_s)
 
-                sc = outfit_score(
+                sc = outfit_score_v2(
                     piece=p,
                     shoes=sh,
                     layer=base,
                     target_style=stile_l,
-                    base_item=base
+                    base_item=base,
+                    prefer_palette=None
                 )
 
                 _upd(
