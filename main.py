@@ -1344,6 +1344,46 @@ def style_score(items, target_style=None) -> float:
     return max(-1.0, min(1.0, score))
 
 
+def effective_color(item) -> str:
+    """Colore più plausibile per scoring: parole nel nome vincono sul campo colore (es. blazer navy vs grigio)."""
+    if not isinstance(item, dict):
+        return ""
+    nome = item.get("nome") or ""
+    colore_raw = item.get("colore")
+    colore = str(colore_raw) if colore_raw is not None else ""
+    nome_l = str(nome).lower()
+
+    for needle, canon in (
+        ("blu navy", "navy"),
+        ("navy", "navy"),
+        ("verde oliva", "verde oliva"),
+        ("oliva", "verde oliva"),
+        ("burgundy", "bordeaux"),
+        ("bordeaux", "bordeaux"),
+        ("cognac", "cognac"),
+        ("cuoio", "cuoio"),
+        ("camel", "cammello"),
+        ("cammello", "cammello"),
+        ("beige", "beige"),
+        ("nero", "nero"),
+        ("bianco", "bianco"),
+        ("grigio", "grigio"),
+        ("celeste", "azzurro"),
+        ("azzurro", "azzurro"),
+        ("blu", "blu"),
+        ("rosso", "rosso"),
+        ("verde", "verde"),
+        ("giallo", "giallo"),
+        ("arancione", "arancione"),
+        ("fucsia", "fucsia"),
+        ("rosa", "rosa"),
+        ("marrone", "marrone"),
+    ):
+        if needle in nome_l:
+            return canon
+    return colore.strip()
+
+
 def outfit_score_v2(
     top=None,
     bottom=None,
@@ -1376,9 +1416,13 @@ def outfit_score_v2(
         return True
 
     def _pair_rel(a, b, acc: list[float]) -> None:
-        if not _has_col(a) or not _has_col(b):
+        if not a or not b:
             return
-        acc.append(color_relation_score(a.get("colore"), b.get("colore")))
+        ca = effective_color(a)
+        cb = effective_color(b)
+        if not ca or not cb:
+            return
+        acc.append(color_relation_score(ca, cb))
 
     rel_vals: list[float] = []
     rel_no_layer: list[float] = []
@@ -1398,9 +1442,16 @@ def outfit_score_v2(
         _pair_rel(layer, shoes, rel_vals)
         _pair_rel(piece, shoes, rel_no_layer)
 
-    color_score = (
-        sum(rel_vals) / len(rel_vals) if rel_vals else 0.0
-    )
+    if rel_vals:
+        mean_score = sum(rel_vals) / len(rel_vals)
+        min_score = min(rel_vals)
+        color_score = mean_score * 0.8 + min_score * 0.2
+        if min_score <= -0.75:
+            color_score = min(color_score, 0.15)
+        elif min_score <= -0.5:
+            color_score = min(color_score, 0.30)
+    else:
+        color_score = 0.0
     color_score = max(-1.0, min(1.0, color_score))
 
     palette = palette_score(items)
