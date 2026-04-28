@@ -3079,6 +3079,8 @@ async def quickpair(
                     )
 
         elif base.get("categoria") == "topLayer":
+            debug_candidates = []
+
             for t in (topBase if len(topBase) <= 20 else rnd.sample(topBase, 20)):
                 for b in (bottom if len(bottom) <= 20 else rnd.sample(bottom, 20)):
                     compat_s = [s for s in scarpe if are_compatible(b.get("colore"), s.get("colore"))] or scarpe
@@ -3093,6 +3095,16 @@ async def quickpair(
                         base_item=base,
                         prefer_palette=None
                     )
+
+                    debug_candidates.append({
+                        "type": "top_bottom",
+                        "score": sc,
+                        "top": t.get("nome"),
+                        "bottom": b.get("nome"),
+                        "piece": None,
+                        "layer": base.get("nome"),
+                        "shoes": sh.get("nome"),
+                    })
 
                     _upd(
                         {
@@ -3119,6 +3131,16 @@ async def quickpair(
                     prefer_palette=None
                 )
 
+                debug_candidates.append({
+                    "type": "piece",
+                    "score": sc,
+                    "top": None,
+                    "bottom": None,
+                    "piece": p.get("nome"),
+                    "layer": base.get("nome"),
+                    "shoes": sh.get("nome"),
+                })
+
                 _upd(
                     {
                         "base": base,
@@ -3130,6 +3152,11 @@ async def quickpair(
                     },
                     sc
                 )
+
+            if str(base.get("nome") or "").lower().strip() == "blazer navy":
+                print("=== QUICKPAIR TOPLAYER CANDIDATES DEBUG ===")
+                for c in sorted(debug_candidates, key=lambda x: x["score"], reverse=True)[:10]:
+                    print(c)
 
         else:
             raise HTTPException(
