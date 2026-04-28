@@ -23,35 +23,41 @@ DRY_RUN = True
 
 TEST_USER_ID = "LYVA0KexDIRnIwROWDsuDdTAdEl2"
 
-IMAGE_URL_PLACEHOLDER = "https://placehold.co/600x800/png?text=MyVogue+Test"
+IMAGE_URL_PLACEHOLDER = "https://placehold.co/600x800/png?text=MyVogue+Primavera"
 
-_STAGIONE = "estate"
+_STAGIONE = "primavera"
 
 # (nome, categoria, colore, stile)
 _TEST_SPECS: list[tuple[str, str, str, str]] = [
     # topBase
-    ("T-shirt bianca", "topBase", "bianco", "casual"),
-    ("Maglietta verde", "topBase", "verde", "streetwear"),
-    ("Camicia azzurra", "topBase", "azzurro", "elegante"),
+    ("Camicia bianca Oxford", "topBase", "bianco", "elegante"),
+    ("Camicia azzurra popeline", "topBase", "azzurro", "elegante"),
+    ("T-shirt bianca premium", "topBase", "bianco", "casual"),
     ("Polo beige", "topBase", "beige", "casual"),
+    ("T-shirt nera basic", "topBase", "nero", "streetwear"),
+    ("Felpa grigio chiaro", "topBase", "grigio", "sportivo"),
     # topLayer
-    ("Blazer navy", "topLayer", "navy", "elegante"),
-    ("Giacca beige", "topLayer", "beige", "casual"),
+    ("Blazer navy leggero", "topLayer", "navy", "elegante"),
+    ("Trench beige", "topLayer", "beige", "elegante"),
+    ("Giacca denim chiara", "topLayer", "azzurro", "casual"),
     ("Bomber verde oliva", "topLayer", "verde oliva", "streetwear"),
-    ("Cardigan nero", "topLayer", "nero", "casual"),
+    ("Cardigan grigio", "topLayer", "grigio", "casual"),
     # bottom
-    ("Pantalone beige", "bottom", "beige", "casual"),
-    ("Jeans denim", "bottom", "blu", "streetwear"),
-    ("Pantalone grigio", "bottom", "grigio", "elegante"),
-    ("Pantalone nero", "bottom", "nero", "elegante"),
+    ("Pantalone chino beige", "bottom", "beige", "casual"),
+    ("Pantalone nero sartoriale", "bottom", "nero", "elegante"),
+    ("Jeans blu dritto", "bottom", "blu", "casual"),
+    ("Gonna midi nera", "bottom", "nero", "elegante"),
+    ("Pantalone grigio elegante", "bottom", "grigio", "elegante"),
+    ("Cargo verde oliva", "bottom", "verde oliva", "streetwear"),
     # scarpe
-    ("Sneaker bianche", "scarpe", "bianco", "casual"),
-    ("Scarpe cognac", "scarpe", "cognac", "elegante"),
-    ("Sneaker grigie", "scarpe", "grigio", "streetwear"),
-    ("Scarpe nere", "scarpe", "nero", "elegante"),
+    ("Mocassini cognac", "scarpe", "cognac", "elegante"),
+    ("Sneakers bianche minimal", "scarpe", "bianco", "casual"),
+    ("Derby nere", "scarpe", "nero", "elegante"),
+    ("Sneakers blu", "scarpe", "blu", "streetwear"),
+    ("Running grigie", "scarpe", "grigio", "sportivo"),
     # pezzoUnico
-    ("Vestito nero", "pezzoUnico", "nero", "elegante"),
-    ("Tuta blu", "pezzoUnico", "blu", "casual"),
+    ("Vestito nero midi", "pezzoUnico", "nero", "elegante"),
+    ("Abito beige leggero", "pezzoUnico", "beige", "casual"),
 ]
 
 
@@ -69,6 +75,7 @@ def _build_payloads() -> list[dict]:
                 "imageUrl": IMAGE_URL_PLACEHOLDER,
                 "isDirty": False,
                 "isPublic": False,
+                "seedTag": "primavera_benchmark_v1",
             }
         )
     return out
