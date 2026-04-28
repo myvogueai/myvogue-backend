@@ -1405,18 +1405,6 @@ def outfit_score_v2(
     if not items:
         return 0.0
 
-    debug_names = [str(i.get("nome") or "") for i in items if isinstance(i, dict)]
-    debug_should_print = any(
-        ("blazer navy" in name.lower()) or ("vestito rosso" in name.lower())
-        for name in debug_names
-    )
-
-    if debug_should_print:
-        print("=== OUTFIT_SCORE_V2 DEBUG START ===")
-        print("items =", [(i.get("nome"), i.get("colore"), effective_color(i)) for i in items if isinstance(i, dict)])
-        print("target_style =", target_style)
-        print("base_item =", base_item.get("nome") if isinstance(base_item, dict) else None)
-
     def _has_col(it) -> bool:
         if not it or not isinstance(it, dict):
             return False
@@ -1465,10 +1453,6 @@ def outfit_score_v2(
     else:
         color_score = 0.0
     color_score = max(-1.0, min(1.0, color_score))
-
-    if debug_should_print:
-        print("rel_vals =", rel_vals)
-        print("color_score =", color_score)
 
     palette = palette_score(items)
     shoe = shoes_score(
@@ -1528,13 +1512,6 @@ def outfit_score_v2(
                 prefer_bonus = min(0.05, 0.02 * match_n)
 
     final += prefer_bonus
-
-    if debug_should_print:
-        print("palette =", palette)
-        print("shoe =", shoe)
-        print("style =", style)
-        print("final_v2 =", final)
-        print("=== OUTFIT_SCORE_V2 DEBUG END ===")
 
     return max(-1.0, min(1.0, final))
 
