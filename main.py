@@ -1405,6 +1405,22 @@ def outfit_score_v2(
     if not items:
         return 0.0
 
+    def _item_with_effective_color(it):
+        if not isinstance(it, dict):
+            return it
+        copied = dict(it)
+        ec = effective_color(it)
+        if ec:
+            copied["colore"] = ec
+        return copied
+
+    top_eff    = _item_with_effective_color(top)
+    bottom_eff = _item_with_effective_color(bottom)
+    shoes_eff  = _item_with_effective_color(shoes)
+    layer_eff  = _item_with_effective_color(layer)
+    piece_eff  = _item_with_effective_color(piece)
+    items_eff  = [_item_with_effective_color(i) for i in items]
+
     def _has_col(it) -> bool:
         if not it or not isinstance(it, dict):
             return False
@@ -1454,11 +1470,11 @@ def outfit_score_v2(
         color_score = 0.0
     color_score = max(-1.0, min(1.0, color_score))
 
-    palette = palette_score(items)
+    palette = palette_score(items_eff)
     shoe = shoes_score(
-        bottom if piece is None else piece,
-        shoes,
-        layer,
+        bottom_eff if piece is None else piece_eff,
+        shoes_eff,
+        layer_eff,
         target_style,
     )
     style = style_score(items, target_style)
