@@ -672,7 +672,13 @@ def _score_visual_balance(top=None, bottom=None, piece=None, shoes=None, layer=N
     accent_count = sum(1 for c in colors if c in accents)
 
     if len(colors) >= 3 and neutral_count == len(colors):
-        score -= 1.2
+        unique_neutral = len(set(colors))
+        if unique_neutral == 1:
+            score += 0.3    # monocromatico intenzionale (total black, total grey)
+        elif unique_neutral == 2:
+            pass            # tonal duo neutro: né bonus né malus
+        else:
+            score -= 0.3    # tre neutri diversi senza accento: lieve piattezza
 
     if neutral_count >= 2 and accent_count == 1:
         score += 2.0
@@ -693,7 +699,9 @@ def _score_visual_balance(top=None, bottom=None, piece=None, shoes=None, layer=N
         if top and bottom and not layer:
             score -= 0.3
 
-    if len(set(colors)) == 2:
+    if len(set(colors)) == 1:
+        score += 0.5        # look monocromatico intenzionale
+    elif len(set(colors)) == 2:
         score += 1.0
     elif len(set(colors)) == 3:
         score += 0.6
@@ -2234,9 +2242,8 @@ async def genera_outfit(
             if pezzo and scarpe:
                 for p in rnd.sample(pezzo, k=min(len(pezzo), 12)):
                     sample_shoes = rnd.sample(scarpe, k=min(len(scarpe), 12))
-                    for sh in sample_shoes:
-                        if not are_compatible(p.get("colore"), sh.get("colore")):
-                            continue
+                    compat_shoes_p = [sh for sh in sample_shoes if are_compatible(p.get("colore"), sh.get("colore"))] or sample_shoes
+                    for sh in compat_shoes_p:
                         compat_layers = [
                             l for l in toplayer
                             if are_compatible(p.get("colore"), l.get("colore"))
@@ -2559,10 +2566,9 @@ async def genera_outfit(
             # pezzo unico
             if pezzo and scarpe:
                 for p in rnd.sample(pezzo, k=min(len(pezzo), 12)):
-                    for sh in rnd.sample(scarpe, k=min(len(scarpe), 12)):
-                        if not are_compatible(p.get("colore"), sh.get("colore")):
-                            continue
-
+                    sample_shoes_p = rnd.sample(scarpe, k=min(len(scarpe), 12))
+                    compat_shoes_p = [sh for sh in sample_shoes_p if are_compatible(p.get("colore"), sh.get("colore"))] or sample_shoes_p
+                    for sh in compat_shoes_p:
                         compat_layers = [
                             l for l in toplayer
                             if are_compatible(p.get("colore"), l.get("colore"))
