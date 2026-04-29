@@ -2961,13 +2961,15 @@ async def quickpair(
                 }
             )
 
-        best, best_score = None, -1.0
+        _TOP_N = 3
+        _SCORE_MARGIN = 1.5
+        top_candidates = []   # list of (score, candidate), sorted desc, max _TOP_N elements
         rnd = random.Random(time.time())
 
         def _upd(candidate, score):
-            nonlocal best, best_score
-            if score > best_score:
-                best_score, best = score, candidate
+            top_candidates.append((score, candidate))
+            top_candidates.sort(key=lambda x: x[0], reverse=True)
+            del top_candidates[_TOP_N:]
 
         if base.get("categoria") == "pezzoUnico":
             for sh in scarpe:
@@ -3171,30 +3173,47 @@ async def quickpair(
                 detail={"code": "UNSUPPORTED_CATEGORY", "message": "Categoria del capo base non gestita."}
             )
 
-        print("quickpair best trovato =", best is not None)
-        print("quickpair best_score =", best_score)
-        if best:
-            print("quickpair best payload =", {
-                "top": (best.get("top") or {}).get("nome"),
-                "bottom": (best.get("bottom") or {}).get("nome"),
-                "piece": (best.get("piece") or {}).get("nome"),
-                "layer": (best.get("layer") or {}).get("nome"),
-                "shoes": (best.get("shoes") or {}).get("nome"),
-            })
-        else:
+        if not top_candidates:
             print("quickpair nessun best trovato")
-
-        if not best:
             return JSONResponse(
                 content={"error": "Impossibile generare un outfit coerente.", "lang": lang}
             )
 
+        best_score = top_candidates[0][0]
+
+        # Filtra per margine qualità: scarta candidati troppo distanti dal top
+        filtered = [(s, c) for s, c in top_candidates if s >= best_score - _SCORE_MARGIN]
+
+        if len(filtered) == 1:
+            selected_score, best = filtered[0]
+            selected_rank = 1
+        else:
+            _sc  = [s for s, _ in filtered]
+            _can = [c for _, c in filtered]
+            _min = min(_sc)
+            _w   = [s - _min + 0.1 for s in _sc]   # peso proporzionale, minimo 0.1
+            _idx = rnd.choices(range(len(filtered)), weights=_w, k=1)[0]
+            selected_score, best = filtered[_idx]
+            selected_rank = _idx + 1   # rank 1-based
+
+        print("quickpair best trovato = True")
+        print("quickpair best_score =", best_score)
+        print("quickpair selected_rank =", selected_rank, "of", len(filtered))
+        print("quickpair best payload =", {
+            "top":    (best.get("top") or {}).get("nome"),
+            "bottom": (best.get("bottom") or {}).get("nome"),
+            "piece":  (best.get("piece") or {}).get("nome"),
+            "layer":  (best.get("layer") or {}).get("nome"),
+            "shoes":  (best.get("shoes") or {}).get("nome"),
+        })
+
         fallback_level = 0
         debug_reason = (
             f"same_style_pool;base_cat={base.get('categoria')};"
-            f"items={len(items)};best_score={best_score:.4f}"
+            f"items={len(items)};best_score={best_score:.4f};"
+            f"topCandidates={len(filtered)};selectedRank={selected_rank}"
         )
-        scores_payload = {"outfit": best_score}
+        scores_payload = {"outfit": selected_score}
 
         parts = []
 
@@ -3247,7 +3266,7 @@ async def quickpair(
             "lang": lang,
             "premium": is_premium,
             "fallbackLevel": fallback_level,
-            "score": best_score,
+            "score": selected_score,
             "scores": scores_payload,
             "debugReason": debug_reason,
         }
