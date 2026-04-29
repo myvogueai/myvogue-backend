@@ -352,34 +352,80 @@ BASIC_COLORS = {
 
 # Mappa sinonimi/varianti -> colore canonico della palette sopra
 COLOR_SYNONYMS = {
-    # varianti comuni e spaziature
-    "verde oliva": "oliva",
-    "blu navy": "blu",
-    "blu scuro": "blu",
-    "blu chiaro": "azzurro",
-    "rosso scuro": "bordeaux",
-    "vinaccia": "bordeaux",
-    "crema": "avorio",
-    "ivory": "avorio",
-    "senape": "senape",
-    "olive": "oliva",
-    "multi": "multicolore",
+    # blu e navy
+    "blu navy":          "blu",
+    "navy":              "blu",
+    "blu scuro":         "blu",
+    "blu chiaro":        "azzurro",
+    "celeste":           "azzurro",
+    "denim":             "blu",
+    "jeans":             "blu",
+    # verdi e oliva
+    "verde oliva":       "oliva",
+    "oliva":             "oliva",
+    "olive":             "oliva",
+    "militare":          "oliva",
+    "verde militare":    "oliva",
+    "kaki":              "oliva",
+    "khaki":             "oliva",
+    # marroni / earth
+    "cognac":            "marrone",
+    "cuoio":             "marrone",
+    "cammello":          "beige",
+    "camel":             "beige",
+    "cammello chiaro":   "beige",
+    "beige caldo":       "beige",
+    "tortora":           "beige",
+    # bianchi / avori
+    "crema":             "avorio",
+    "ivory":             "avorio",
+    "panna":             "avorio",
+    "ecru":              "avorio",
+    "écru":              "avorio",
+    "champagne":         "avorio",
+    # grigi / scuri
+    "antracite":         "grigio",
+    "grafite":           "grigio",
+    "grigio scuro":      "grigio",
+    "grigio chiaro":     "grigio",
+    "grigio melange":    "grigio",
+    # rossi / bordeaux
+    "bordeaux":          "bordeaux",
+    "burgundy":          "bordeaux",
+    "vinaccia":          "bordeaux",
+    "rosso scuro":       "bordeaux",
+    "ruggine":           "arancione",
+    "terracotta":        "arancione",
+    # rosa / viola
+    "fucsia":            "rosa",
+    "magenta":           "rosa",
+    "viola":             "lilla",
+    "lavanda":           "lilla",
+    "lilla chiaro":      "lilla",
+    # metallici
+    "oro":               "giallo",
+    "dorato":            "giallo",
+    "argento":           "grigio",
+    "argentato":         "grigio",
+    # altri
+    "senape":            "senape",
+    "multi":             "multicolore",
+    "multicolor":        "multicolore",
+    "stampa":            "multicolore",
 }
 
 def normalize_color(c: str | None) -> str:
-    """Normalizza in minuscolo, mappa i sinonimi e fallback sicuro."""
+    """Normalizza in minuscolo, mappa i sinonimi; restituisce 'sconosciuto' se il colore non è riconosciuto."""
     if not c:
         return "sconosciuto"
     x = str(c).strip().lower()
     x = COLOR_SYNONYMS.get(x, x)
-    # se non è nella nostra tavolozza, fallback neutro per non bloccare matching
     if x not in BASIC_COLORS:
-        # prova riduzioni semplici
+        # prova riduzioni semplici (trattini, underscore)
         x = x.replace("-", " ").replace("_", " ")
         x = COLOR_SYNONYMS.get(x, x)
     if x not in BASIC_COLORS:
-        # ultima spiaggia: rendilo neutro
-        return "grigio"
+        return "sconosciuto"
     return x
 
 def are_compatible(c1, c2):
@@ -387,49 +433,7 @@ def are_compatible(c1, c2):
     return c2 in BASIC_COLORS.get(c1, []) or c1 in BASIC_COLORS.get(c2, [])
 
 
-def color_relation_score(c1, c2):
-    """Score di armonia tra due colori in [-1, +1]."""
-    _LOCAL_CANON = {"cognac": "marrone", "viola": "lilla"}
-
-    def _canon(c):
-        if not c:
-            return normalize_color(c)
-        raw = str(c).strip().lower()
-        if raw in _LOCAL_CANON:
-            return _LOCAL_CANON[raw]
-        return normalize_color(c)
-
-    n1, n2 = _canon(c1), _canon(c2)
-    if n1 == "sconosciuto" or n2 == "sconosciuto":
-        return 0.2
-    if n1 == n2:
-        return 1.0
-
-    if {n1, n2} == {"rosso", "verde"}:
-        return -1.0
-    if {n1, n2} == {"giallo", "lilla"}:
-        return -0.65
-
-    neutrals = {"nero", "bianco", "grigio", "beige", "avorio", "multicolore"}
-    earth = {"marrone"}
-    navy_blue_gray = {"blu", "azzurro", "grigio"}
-    if (n1 in earth and n2 in navy_blue_gray) or (n2 in earth and n1 in navy_blue_gray):
-        return 0.9
-
-    if n1 in neutrals and n2 in neutrals:
-        return 0.35
-    if n1 in neutrals or n2 in neutrals:
-        return 0.55
-
-    strong = {
-        "rosso", "verde", "giallo", "arancione", "bordeaux",
-        "lilla", "rosa", "senape",
-    }
-    if n1 in strong and n2 in strong:
-        return -0.5
-
-    return 0.2
-
+# color_relation_score è definita più avanti (dopo palette helpers); questa era la versione precedente ora rimossa.
 
 def _norm_text(value):
     return str(value or "").strip().lower()
@@ -713,50 +717,49 @@ def _score_base_item_fit(
         return normalize_color(it.get("colore")) if it else None
 
     if base_cat == "bottom":
-        if top and are_compatible(base_color, col(top)):
-            score += 2.0
-        if shoes and are_compatible(base_color, col(shoes)):
-            score += 1.8
+        if top:
+            score += color_relation_score(base_color, col(top)) * 2.0
+        if shoes:
+            score += color_relation_score(base_color, col(shoes)) * 1.8
         if layer and top:
-            if (
-                are_compatible(col(layer), col(top))
-                or are_compatible(col(layer), base_color)
-            ):
-                score += 0.8
+            score += max(
+                color_relation_score(col(layer), col(top)),
+                color_relation_score(col(layer), base_color)
+            ) * 0.8
 
     elif base_cat == "topBase":
-        if bottom and are_compatible(base_color, col(bottom)):
-            score += 2.0
-        if layer and are_compatible(base_color, col(layer)):
-            score += 1.0
-        if shoes and bottom and are_compatible(col(bottom), col(shoes)):
-            score += 1.2
+        if bottom:
+            score += color_relation_score(base_color, col(bottom)) * 2.0
+        if layer:
+            score += color_relation_score(base_color, col(layer)) * 1.0
+        if shoes and bottom:
+            score += color_relation_score(col(bottom), col(shoes)) * 1.2
 
     elif base_cat == "scarpe":
-        if bottom and are_compatible(base_color, col(bottom)):
-            score += 2.4
-        if top and bottom and are_compatible(col(top), col(bottom)):
-            score += 1.0
-        if layer and top and are_compatible(col(layer), col(top)):
-            score += 0.5
-        if piece and are_compatible(base_color, col(piece)):
-            score += 2.0
+        if bottom:
+            score += color_relation_score(base_color, col(bottom)) * 2.4
+        if top and bottom:
+            score += color_relation_score(col(top), col(bottom)) * 1.0
+        if layer and top:
+            score += color_relation_score(col(layer), col(top)) * 0.5
+        if piece:
+            score += color_relation_score(base_color, col(piece)) * 2.0
 
     elif base_cat == "topLayer":
-        if top and are_compatible(base_color, col(top)):
-            score += 1.8
-        if bottom and top and are_compatible(col(top), col(bottom)):
-            score += 1.2
-        if shoes and bottom and are_compatible(col(bottom), col(shoes)):
-            score += 0.8
-        if piece and are_compatible(base_color, col(piece)):
-            score += 1.5
+        if top:
+            score += color_relation_score(base_color, col(top)) * 1.8
+        if bottom and top:
+            score += color_relation_score(col(top), col(bottom)) * 1.2
+        if shoes and bottom:
+            score += color_relation_score(col(bottom), col(shoes)) * 0.8
+        if piece:
+            score += color_relation_score(base_color, col(piece)) * 1.5
 
     elif base_cat == "pezzoUnico":
-        if shoes and are_compatible(base_color, col(shoes)):
-            score += 2.3
-        if layer and are_compatible(base_color, col(layer)):
-            score += 1.0
+        if shoes:
+            score += color_relation_score(base_color, col(shoes)) * 2.3
+        if layer:
+            score += color_relation_score(base_color, col(layer)) * 1.0
 
     return score
 
@@ -1551,20 +1554,20 @@ def outfit_score(
     score = 0.0
 
     # =========================
-    # 1) Compatibilità colore
+    # 1) Compatibilità colore (graduata)
     # =========================
-    if piece and shoes and are_compatible(piece.get("colore"), shoes.get("colore")):
-        score += 1.0
-    if top and bottom and are_compatible(top.get("colore"), bottom.get("colore")):
-        score += 1.0
-    if bottom and shoes and are_compatible(bottom.get("colore"), shoes.get("colore")):
-        score += 1.0
-    if top and layer and are_compatible(top.get("colore"), layer.get("colore")):
-        score += 0.5
-    if bottom and layer and are_compatible(bottom.get("colore"), layer.get("colore")):
-        score += 0.5
-    if piece and layer and are_compatible(piece.get("colore"), layer.get("colore")):
-        score += 0.5
+    if piece and shoes:
+        score += color_relation_score(piece.get("colore"), shoes.get("colore")) * 1.4
+    if top and bottom:
+        score += color_relation_score(top.get("colore"), bottom.get("colore")) * 1.4
+    if bottom and shoes:
+        score += color_relation_score(bottom.get("colore"), shoes.get("colore")) * 1.4
+    if top and layer:
+        score += color_relation_score(top.get("colore"), layer.get("colore")) * 0.7
+    if bottom and layer:
+        score += color_relation_score(bottom.get("colore"), layer.get("colore")) * 0.7
+    if piece and layer:
+        score += color_relation_score(piece.get("colore"), layer.get("colore")) * 0.7
 
     # =========================
     # 2) Bias cromatico
@@ -3084,14 +3087,13 @@ async def quickpair(
                     compat_s = [s for s in scarpe if are_compatible(b.get("colore"), s.get("colore"))] or scarpe
                     sh = rnd.choice(compat_s)
 
-                    sc = outfit_score_v2(
+                    sc = outfit_score(
                         top=t,
                         bottom=b,
                         shoes=sh,
                         layer=base,
                         target_style=stile_l,
                         base_item=base,
-                        prefer_palette=None
                     )
 
                     _upd(
@@ -3110,13 +3112,12 @@ async def quickpair(
                 compat_s = [s for s in scarpe if are_compatible(p.get("colore"), s.get("colore"))] or scarpe
                 sh = rnd.choice(compat_s)
 
-                sc = outfit_score_v2(
+                sc = outfit_score(
                     piece=p,
                     shoes=sh,
                     layer=base,
                     target_style=stile_l,
                     base_item=base,
-                    prefer_palette=None
                 )
 
                 _upd(
