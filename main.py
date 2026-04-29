@@ -454,10 +454,19 @@ def _has_any(text, keywords):
 
 
 def _infer_style_from_items(top=None, bottom=None, piece=None, shoes=None, layer=None):
+    counts: dict[str, int] = {}
     for it in (piece, top, bottom, shoes, layer):
-        if it and normalize_stile(it.get("stile")):
-            return normalize_stile(it.get("stile"))
-    return ""
+        s = it and normalize_stile(it.get("stile"))
+        if s:
+            counts[s] = counts.get(s, 0) + 1
+    if not counts:
+        return ""
+    max_count = max(counts.values())
+    candidates = [s for s, n in counts.items() if n == max_count]
+    for priority in ("elegante", "streetwear", "casual", "sportivo"):
+        if priority in candidates:
+            return priority
+    return candidates[0]
 
 
 # =========================
@@ -665,7 +674,7 @@ def _score_visual_balance(top=None, bottom=None, piece=None, shoes=None, layer=N
     style = normalize_stile(target_style)
     score = 0.0
 
-    neutrals = {"nero", "bianco", "grigio", "beige", "avorio"}
+    neutrals = {"nero", "bianco", "grigio", "beige", "avorio", "marrone"}
     accents = {"rosso", "rosa", "lilla", "verde", "oliva", "giallo", "senape", "arancione", "bordeaux", "azzurro", "blu"}
 
     neutral_count = sum(1 for c in colors if c in neutrals)
@@ -681,7 +690,7 @@ def _score_visual_balance(top=None, bottom=None, piece=None, shoes=None, layer=N
             score -= 0.3    # tre neutri diversi senza accento: lieve piattezza
 
     if neutral_count >= 2 and accent_count == 1:
-        score += 2.0
+        score += 1.4
 
     if accent_count >= 3:
         score -= 2.2
