@@ -3190,6 +3190,18 @@ async def quickpair(
         if slim_shoes and slim_shoes["id"] == slim_base["id"]:
             slim_shoes = None
 
+        # Il capo cliccato deve sempre comparire in suggestion nel campo corretto.
+        if base_cat == "topBase":
+            slim_top = slim_base
+        elif base_cat == "topLayer":
+            slim_layer = slim_base
+        elif base_cat == "bottom":
+            slim_bottom = slim_base
+        elif base_cat == "scarpe":
+            slim_shoes = slim_base
+        elif base_cat == "pezzoUnico":
+            slim_piece = slim_base
+
         payload = {
             "base": slim_base,
             "suggestion": {
