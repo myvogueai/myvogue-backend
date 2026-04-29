@@ -467,13 +467,17 @@ def _infer_style_from_items(top=None, bottom=None, piece=None, shoes=None, layer
 STREET_SHOES_GOOD = [
     "sneaker", "sneakers", "trainer", "running", "skate",
     "air force", "dunk", "gazelle", "campus", "new balance",
-    "converse", "vans", "urban", "chunky"
+    "converse", "vans", "urban", "chunky",
+    "air max", "low top", "high top",
 ]
 
 FORMAL_SHOES = [
     "mocassino", "mocassini", "loafer", "loafers",
     "derby", "stringata", "stringate", "oxford",
-    "francesina", "elegante", "classica", "classiche"
+    "francesina", "elegante", "classica", "classiche",
+    "chelsea", "chelsea boot", "stivaletto", "stivaletti",
+    "tacco", "tacchi", "pump", "pumps",
+    "slingback", "décolleté", "decollete",
 ]
 
 SPORT_SHOES = [
@@ -483,13 +487,15 @@ SPORT_SHOES = [
 STREET_TOPLAYER_GOOD = [
     "hoodie", "felpa", "oversize", "bomber", "denim jacket",
     "giubbotto", "giacca di jeans", "varsity", "college",
-    "cargo jacket", "puffer", "street"
+    "cargo jacket", "puffer", "street",
+    "giacca denim", "denim chiara", "cardigan oversize", "cardigan lungo",
 ]
 
 ELEGANT_TOPLAYER_GOOD = [
     "blazer", "giacca sartoriale", "giacca elegante",
     "doppiopetto", "monopetto", "tailored", "strutturata",
-    "cappotto", "trench"
+    "cappotto", "trench",
+    "cardigan", "cardigan fine", "cardigan lana", "cardigan cashmere",
 ]
 
 TOPLAYER_TOO_HEAVY = [
@@ -839,6 +845,18 @@ def color_relation_score(c1, c2) -> float:
 
     if t1 == t2:
         return 0.65
+
+    # Coppie neutre classiche: abbinamenti iconici moda, non mediocri
+    _CLASSIC = {
+        frozenset({"bianco", "nero"}):   0.85,
+        frozenset({"bianco", "grigio"}): 0.80,
+        frozenset({"nero",   "grigio"}): 0.75,
+        frozenset({"bianco", "beige"}):  0.72,
+        frozenset({"nero",   "beige"}):  0.72,
+        frozenset({"grigio", "beige"}):  0.68,
+    }
+    if frozenset({t1, t2}) in _CLASSIC:
+        return _CLASSIC[frozenset({t1, t2})]
 
     if same_color_family(t1, r1, t2, r2):
         return 0.75
