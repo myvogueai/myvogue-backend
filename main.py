@@ -151,6 +151,16 @@ def get_user_lang(userId: str, default="it"):
     return default
 
 
+def get_effective_premium_from_firestore(userId: str) -> bool:
+    """Fonte unica per /outfit: non usare il flag premium inviato dal client."""
+    try:
+        udoc = db.collection("users").document(userId).get()
+        if not udoc.exists:
+            return False
+        return bool((udoc.to_dict() or {}).get("isPremium", False))
+    except Exception:
+        return False
+
 
 def avoid_recent(items, recent_ids):
     """Evita di ripetere troppo spesso gli stessi capi."""
@@ -2076,10 +2086,19 @@ async def genera_outfit(
         lang = (lang or get_user_lang(userId, "it")).lower()
         lang_name = LANG_NAME.get(lang, "italiano")
 
+        client_premium_flag = bool(premium)
+        db_premium = get_effective_premium_from_firestore(userId)
+        effective_premium = db_premium
+        print(
+            "OUTFIT PREMIUM CHECK "
+            f"userId={userId} clientPremium={client_premium_flag} "
+            f"dbPremium={db_premium} effectivePremium={effective_premium}"
+        )
+
         # =========================
         # RAMO PREMIUM
         # =========================
-        if premium:
+        if effective_premium:
             if not stile_l_req:
                 return JSONResponse(
                     content={"error": "Per gli utenti Premium è necessario specificare 'stile'."},
