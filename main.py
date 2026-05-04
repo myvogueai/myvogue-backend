@@ -4,6 +4,7 @@ from io import BytesIO
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, File, UploadFile, Form, Query, HTTPException, Body, Request
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -12,6 +13,7 @@ from PIL import Image, ImageOps
 
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
+from firebase_admin import auth as firebase_auth
 from zoneinfo import ZoneInfo
 from hashlib import sha256
 from pillow_heif import register_heif_opener
@@ -64,6 +66,15 @@ FIREBASE_BUCKET = os.getenv("FIREBASE_BUCKET", "")
 
 # Modalità community: TRUE => solo armadi pubblici; gli altri endpoint community rispondono 503
 COMMUNITY_PUBLIC_ONLY = os.getenv("COMMUNITY_PUBLIC_ONLY", "true").lower() == "true"
+
+# IAP: Premium attivabile solo dopo verifica lato store (Google Play / App Store).
+# Finché non implementata / non abilitata: nessuna scrittura isPremium.
+IAP_STORE_VERIFICATION_READY = os.getenv("IAP_STORE_VERIFICATION_READY", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+IAP_PRODUCT_IDS = frozenset({"premium_monthly", "premium_yearly"})
 
 # ------------------------------
 # 5) INIT OpenAI
@@ -2235,6 +2246,86 @@ async def log_all_requests(request: Request, call_next):
 @app.get("/")
 async def root():
     return {"status": "ok", "community_public_only": COMMUNITY_PUBLIC_ONLY}
+
+
+class IapVerifyBody(BaseModel):
+    """Payload client per POST /iap/verify (nessun flag premium dal client)."""
+
+    platform: str | None = None
+    productId: str = Field(..., min_length=1)
+    purchaseToken: str | None = None
+    verificationData: str | None = None
+    purchaseId: str | None = None
+    source: str | None = None
+
+
+@app.post("/iap/verify")
+async def iap_verify(request: Request, body: IapVerifyBody):
+    """
+    Verifica Firebase ID token + whitelist prodotto; grant Premium solo dopo
+    verifica reale con lo store (Google Play / Apple). TODO: chiamate API store.
+    """
+    auth_header = request.headers.get("Authorization") or ""
+    prefix = "Bearer "
+    if not auth_header.startswith(prefix):
+        return JSONResponse(
+            status_code=401,
+            content={"granted": False, "code": "MISSING_OR_INVALID_AUTHORIZATION"},
+        )
+    id_token = auth_header[len(prefix) :].strip()
+    if not id_token:
+        return JSONResponse(
+            status_code=401,
+            content={"granted": False, "code": "MISSING_OR_INVALID_AUTHORIZATION"},
+        )
+
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+        uid = decoded.get("uid")
+        if not uid:
+            return JSONResponse(
+                status_code=401,
+                content={"granted": False, "code": "INVALID_FIREBASE_TOKEN"},
+            )
+    except Exception:
+        return JSONResponse(
+            status_code=401,
+            content={"granted": False, "code": "INVALID_FIREBASE_TOKEN"},
+        )
+
+    if body.productId not in IAP_PRODUCT_IDS:
+        return JSONResponse(
+            status_code=200,
+            content={"granted": False, "code": "INVALID_PRODUCT_ID"},
+        )
+
+    store_token = (body.purchaseToken or body.verificationData or "").strip()
+    if not store_token:
+        return JSONResponse(
+            status_code=200,
+            content={"granted": False, "code": "MISSING_PURCHASE_TOKEN"},
+        )
+
+    # TODO: chiamare Google Play Developer API / Apple App Store Server API usando
+    # store_token, body.productId, uid (e purchaseId se serve). Nessun grant senza risposta store valida.
+
+    print(
+        f"=== /iap/verify uid={uid} productId={body.productId} "
+        f"platform={body.platform!r} iap_ready={IAP_STORE_VERIFICATION_READY} ==="
+    )
+
+    if not IAP_STORE_VERIFICATION_READY:
+        return JSONResponse(
+            status_code=200,
+            content={"granted": False, "code": "IAP_VERIFICATION_NOT_CONFIGURED"},
+        )
+
+    # Implementazione futura: verifica store + Admin SDK su users/{uid}
+    return JSONResponse(
+        status_code=200,
+        content={"granted": False, "code": "IAP_VERIFICATION_NOT_CONFIGURED"},
+    )
+
 
 # ------------------------------
 # 12) /upload — Upload immagine + background removal + Storage
