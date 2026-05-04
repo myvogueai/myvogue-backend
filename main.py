@@ -503,6 +503,26 @@ SPORT_SHOES = [
     "running", "training", "gym", "sport", "sportive", "tennis"
 ]
 
+# Keyword “tecnico” per micro-regola formalità (evitare running in elegante).
+_RUNNING_HEAVY_KW = (
+    "da running",
+    "running",
+    "marathon",
+    "trail run",
+    "gara",
+    "spikes",
+    "spike",
+)
+
+# Outer leggero “chic” (non parka pesante: escluso da TOPLAYER_TOO_HEAVY via check).
+_CHIC_LIGHT_OUTER_KW = (
+    "trench",
+    "caban",
+    "peacoat",
+    "duster",
+    "cappotto",
+)
+
 STREET_TOPLAYER_GOOD = [
     "hoodie", "felpa", "oversize", "bomber", "denim jacket",
     "giubbotto", "giacca di jeans", "varsity", "college",
@@ -608,7 +628,38 @@ def _score_real_toplayer(top_layer_item, target_style):
         if _has_any(text, STREET_TOPLAYER_GOOD):
             score += 0.4
 
+    if style in ("elegante", "casual") and _has_any(text, _CHIC_LIGHT_OUTER_KW) and not _has_any(
+        text, TOPLAYER_TOO_HEAVY
+    ):
+        score += 0.2
+    if style in ("casual", "streetwear") and any(
+        k in text for k in ("denim", "di jeans", "jeans")
+    ) and any(k in text for k in ("giacca", "jacket", "giubb", "giubbotto")):
+        score += 0.12
+
     return score
+
+
+def _light_formality_tune(shoes, layer, target_style) -> float:
+    """Micro-aggiustamento formalità; contributo piccolo e clampato."""
+    s = normalize_stile(target_style)
+    if not s:
+        return 0.0
+    stxt = _item_text(shoes) if shoes else ""
+    ltxt = _item_text(layer) if layer else ""
+    adj = 0.0
+    if s == "elegante" and shoes and _has_any(stxt, _RUNNING_HEAVY_KW):
+        adj -= 0.24
+    if s == "elegante" and shoes and layer and _has_any(
+        ltxt, ("blazer", "sartoriale", "doppiopetto", "monopetto")
+    ):
+        if _has_any(stxt, SPORT_SHOES) and not _has_any(stxt, STREET_SHOES_GOOD):
+            adj -= 0.2
+    if s in ("casual", "streetwear") and shoes and layer:
+        if any(k in ltxt for k in ("denim", "giacca denim", "di jeans", "jeans jacket")):
+            if _has_any(stxt, ("sneaker", "sneakers")) and not _has_any(stxt, _RUNNING_HEAVY_KW):
+                adj += 0.12
+    return max(-0.28, min(0.28, adj))
     
 def _score_shoes_layer_combo(shoes_item, top_layer_item, target_style):
     """
@@ -680,7 +731,13 @@ def _score_visual_balance(top=None, bottom=None, piece=None, shoes=None, layer=N
     if not items:
         return 0.0
 
-    colors = [normalize_color(it.get("colore")) for it in items if it.get("colore")]
+    colors: list[str] = []
+    for it in items:
+        raw = _color_raw_for_score_v1(it)
+        if raw:
+            nc = normalize_color(raw)
+            if nc != "sconosciuto":
+                colors.append(nc)
     style = normalize_stile(target_style)
     score = 0.0
 
@@ -743,58 +800,301 @@ def _score_base_item_fit(
         return 0.0
 
     base_cat = base_item.get("categoria")
-    base_color = normalize_color(base_item.get("colore"))
+    br = _color_raw_for_score_v1(base_item) or str(base_item.get("colore") or "").strip() or ""
     score = 0.0
 
-    def col(it):
-        return normalize_color(it.get("colore")) if it else None
+    def colr(it):
+        if not it:
+            return ""
+        return _color_raw_for_score_v1(it) or str(it.get("colore") or "").strip() or ""
 
     if base_cat == "bottom":
         if top:
-            score += color_relation_score(base_color, col(top)) * 2.0
+            score += color_relation_score(br, colr(top)) * 2.0
         if shoes:
-            score += color_relation_score(base_color, col(shoes)) * 1.8
+            score += color_relation_score(br, colr(shoes)) * 1.8
         if layer and top:
             score += max(
-                color_relation_score(col(layer), col(top)),
-                color_relation_score(col(layer), base_color)
+                color_relation_score(colr(layer), colr(top)),
+                color_relation_score(colr(layer), br)
             ) * 0.8
 
     elif base_cat == "topBase":
         if bottom:
-            score += color_relation_score(base_color, col(bottom)) * 2.0
+            score += color_relation_score(br, colr(bottom)) * 2.0
         if layer:
-            score += color_relation_score(base_color, col(layer)) * 1.0
+            score += color_relation_score(br, colr(layer)) * 1.0
         if shoes and bottom:
-            score += color_relation_score(col(bottom), col(shoes)) * 1.2
+            score += color_relation_score(colr(bottom), colr(shoes)) * 1.2
 
     elif base_cat == "scarpe":
         if bottom:
-            score += color_relation_score(base_color, col(bottom)) * 2.4
+            score += color_relation_score(br, colr(bottom)) * 2.4
         if top and bottom:
-            score += color_relation_score(col(top), col(bottom)) * 1.0
+            score += color_relation_score(colr(top), colr(bottom)) * 1.0
         if layer and top:
-            score += color_relation_score(col(layer), col(top)) * 0.5
+            score += color_relation_score(colr(layer), colr(top)) * 0.5
         if piece:
-            score += color_relation_score(base_color, col(piece)) * 2.0
+            score += color_relation_score(br, colr(piece)) * 2.0
 
     elif base_cat == "topLayer":
         if top:
-            score += color_relation_score(base_color, col(top)) * 1.8
+            score += color_relation_score(br, colr(top)) * 1.8
         if bottom and top:
-            score += color_relation_score(col(top), col(bottom)) * 1.2
+            score += color_relation_score(colr(top), colr(bottom)) * 1.2
         if shoes and bottom:
-            score += color_relation_score(col(bottom), col(shoes)) * 0.8
+            score += color_relation_score(colr(bottom), colr(shoes)) * 0.8
         if piece:
-            score += color_relation_score(base_color, col(piece)) * 1.5
+            score += color_relation_score(br, colr(piece)) * 1.5
 
     elif base_cat == "pezzoUnico":
         if shoes:
-            score += color_relation_score(base_color, col(shoes)) * 2.3
+            score += color_relation_score(br, colr(shoes)) * 2.3
         if layer:
-            score += color_relation_score(base_color, col(layer)) * 1.0
+            score += color_relation_score(br, colr(layer)) * 1.0
 
     return score
+
+
+# Archetipi outfit (QuickPair / outfit_score v1): bonus piccoli, hard cap globale.
+_ARCH_MAX_TOTAL = 0.15
+
+_ARCH_DENIM_LAYER_KW = (
+    "denim",
+    "jeans",
+    "giacca di jeans",
+    "giacca denim",
+    "denim jacket",
+    "giubbotto di jeans",
+)
+
+_ARCH_FORMAL_SHOE_KW = (
+    "mocassino",
+    "mocassini",
+    "loafer",
+    "loafers",
+    "derby",
+    "oxford",
+    "stringata",
+    "stringate",
+    "francesina",
+)
+
+
+def archetype_combo_bonus(items: dict, target_style: str | None, base_item: dict | None) -> float:
+    """
+    Bonus sagomati su combo classiche reali. Max totale _ARCH_MAX_TOTAL.
+    Richiede top + bottom + scarpe; niente bonus su categorie incoerenti.
+    """
+    _ = base_item
+    top = items.get("top")
+    bottom = items.get("bottom")
+    shoes = items.get("shoes")
+    layer = items.get("layer")
+    piece = items.get("piece")
+
+    if piece or not top or not bottom or not shoes:
+        return 0.0
+    if bottom.get("categoria") != "bottom" or top.get("categoria") != "topBase":
+        return 0.0
+    if shoes.get("categoria") != "scarpe":
+        return 0.0
+    if layer is not None and layer.get("categoria") != "topLayer":
+        return 0.0
+
+    tgt = normalize_stile(target_style)
+
+    def _nec(d: dict | None) -> str | None:
+        if not d:
+            return None
+        raw = effective_color(d) or d.get("colore")
+        if raw is None or (isinstance(raw, str) and not str(raw).strip()):
+            return None
+        n = normalize_color(raw)
+        return n if n != "sconosciuto" else None
+
+    def _sig_bottom_earth(b: dict) -> bool:
+        raw = f"{b.get('colore') or ''} {b.get('nome') or ''}".lower()
+        t = _nec(b)
+        if t in ("marrone", "beige"):
+            return True
+        if any(k in raw for k in ("cognac", "cuoio", "camel", "cammello")):
+            return True
+        return False
+
+    def _sig_top_white_light(t: dict) -> bool:
+        raw = (t.get("nome") or "").lower()
+        tc = _nec(t)
+        if tc in ("bianco", "avorio"):
+            return True
+        if "avorio" in raw or "bianco" in raw:
+            return True
+        return False
+
+    def _sig_layer_denim(l: dict | None) -> bool:
+        if not l:
+            return False
+        if l.get("categoria") != "topLayer":
+            return False
+        txt = _item_text(l)
+        if not any(k in txt for k in _ARCH_DENIM_LAYER_KW):
+            return False
+        lc = _nec(l) or normalize_color(l.get("colore"))
+        return lc in ("blu", "azzurro", "nero") or "blu" in txt or "navy" in txt
+
+    def _sig_shoes_white_or_sneaker(s: dict) -> bool:
+        txt = _item_text(s)
+        sc = _nec(s)
+        if sc == "bianco":
+            return True
+        if _has_any(
+            txt,
+            ("sneaker", "sneakers", "trainer", "running", "skate", "tennis", "basket"),
+        ):
+            return True
+        return False
+
+    def _sig_shoes_formal(s: dict) -> bool:
+        txt = _item_text(s)
+        return any(k in txt for k in _ARCH_FORMAL_SHOE_KW)
+
+    def _sig_shoes_earth_leather(s: dict) -> bool:
+        raw = f"{s.get('colore') or ''} {s.get('nome') or ''}".lower()
+        sc = _nec(s)
+        if sc == "marrone":
+            return True
+        if any(k in raw for k in ("cognac", "cuoio", "camel", "mocassin", "mocassino")):
+            return True
+        return _sig_shoes_formal(s)
+
+    def _sig_top_shirtish(t: dict) -> bool:
+        raw = (t.get("nome") or "").lower()
+        if "camicia" in raw or "shirt" in raw:
+            return True
+        return _sig_top_white_light(t)
+
+    def _sig_layer_blazer_navy_black(l: dict | None) -> bool:
+        if not l or l.get("categoria") != "topLayer":
+            return False
+        txt = _item_text(l)
+        if not any(k in txt for k in ("blazer", "giacca sartoriale", "doppiopetto", "monopetto")):
+            return False
+        lc = _nec(l) or normalize_color(l.get("colore"))
+        raw = f"{l.get('colore') or ''} {l.get('nome') or ''}".lower()
+        if lc in ("nero", "blu") or "navy" in raw:
+            return True
+        return False
+
+    bonuses: list[float] = []
+
+    # A) terra + top chiaro + denim + sneakers/bianco · casual / streetwear
+    if tgt in ("casual", "streetwear"):
+        sig_a = (
+            int(_sig_bottom_earth(bottom)),
+            int(_sig_top_white_light(top)),
+            int(_sig_layer_denim(layer)),
+            int(_sig_shoes_white_or_sneaker(shoes)),
+            int(tgt in ("casual", "streetwear")),
+        )
+        if (
+            sum(sig_a) >= 3
+            and (_sig_shoes_white_or_sneaker(shoes) or _sig_layer_denim(layer))
+        ):
+            bonuses.append(0.15)
+
+    # B) nero + camicia/bianco + blazer + formale · elegante
+    if tgt == "elegante":
+        sig_b = (
+            int(_nec(bottom) == "nero"),
+            int(_sig_top_shirtish(top)),
+            int(_sig_layer_blazer_navy_black(layer)),
+            int(_sig_shoes_formal(shoes)),
+            int(tgt == "elegante"),
+        )
+        if sum(sig_b) >= 3 and (
+            _sig_shoes_formal(shoes) or _sig_layer_blazer_navy_black(layer)
+        ):
+            bonuses.append(0.15)
+
+    # C) beige + camicia/bianco/azzurro + scarpe cuoio · casual / elegante
+    if tgt in ("casual", "elegante"):
+        tc = _nec(top)
+        top_azz_bianco = tc in ("bianco", "avorio", "azzurro") or _sig_top_shirtish(top)
+        sig_c = (
+            int(_nec(bottom) == "beige"),
+            int(top_azz_bianco),
+            int(_sig_shoes_earth_leather(shoes)),
+            int(tgt in ("casual", "elegante")),
+        )
+        if sum(sig_c) >= 3 and _sig_shoes_earth_leather(shoes):
+            bonuses.append(0.12)
+
+    btxt = (bottom.get("nome") or "").lower()
+
+    def _sig_shoes_boot_clean(s: dict) -> bool:
+        txt = _item_text(s)
+        return any(k in txt for k in ("chelsea", "stivaletto", "stival", "ankle boot", "beatle"))
+
+    # D) Jeans / denim + top chiaro + sneaker · casual / streetwear
+    if tgt in ("casual", "streetwear"):
+        jeansish = "jeans" in btxt or "denim" in btxt or _nec(bottom) in ("blu", "azzurro")
+        sig_d = (
+            int(jeansish),
+            int(_sig_top_white_light(top)),
+            int(_sig_shoes_white_or_sneaker(shoes)),
+            int(tgt in ("casual", "streetwear")),
+        )
+        if sum(sig_d) >= 3 and _sig_shoes_white_or_sneaker(shoes):
+            bonuses.append(0.10)
+
+    # E) Blu / navy smart + camicia + scarpe formali
+    if tgt in ("elegante", "casual"):
+        navyish = "navy" in btxt or _nec(bottom) == "blu"
+        sig_e = (
+            int(navyish),
+            int(_sig_top_shirtish(top)),
+            int(_sig_shoes_formal(shoes)),
+            int(tgt in ("elegante", "casual")),
+        )
+        if sum(sig_e) >= 3 and _sig_shoes_formal(shoes):
+            bonuses.append(0.10)
+
+    # F) Grigio + top neutro + scarpe nere
+    if tgt in ("casual", "elegante", "streetwear"):
+        tn = _nec(top)
+        sig_f = (
+            int(_nec(bottom) == "grigio"),
+            int(tn in ("bianco", "avorio", "nero", "grigio") if tn else False),
+            int(_nec(shoes) == "nero"),
+            int(tgt in ("casual", "elegante", "streetwear")),
+        )
+        if sum(sig_f) >= 3 and _nec(shoes) == "nero":
+            bonuses.append(0.08)
+
+    # G) Oliva / military + top chiaro + sneaker
+    if tgt in ("casual", "streetwear"):
+        olivaish = _nec(bottom) == "oliva" or "oliva" in btxt or "military" in btxt
+        sig_g = (
+            int(olivaish),
+            int(_sig_top_white_light(top)),
+            int(_sig_shoes_white_or_sneaker(shoes)),
+        )
+        if sum(sig_g) >= 3 and _sig_shoes_white_or_sneaker(shoes):
+            bonuses.append(0.10)
+
+    # H) Nero bottom + top chiaro + stivaletti puliti
+    if tgt in ("casual", "elegante"):
+        sig_h = (
+            int(_nec(bottom) == "nero"),
+            int(_sig_top_white_light(top)),
+            int(_sig_shoes_boot_clean(shoes)),
+        )
+        if sum(sig_h) >= 3 and _sig_shoes_boot_clean(shoes):
+            bonuses.append(0.10)
+
+    if not bonuses:
+        return 0.0
+    return min(_ARCH_MAX_TOTAL, max(bonuses))
 
 
 NEUTRALS = {"bianco", "nero", "grigio", "navy", "beige"}
@@ -1432,6 +1732,19 @@ def effective_color(item) -> str:
     return colore.strip()
 
 
+def _color_raw_for_score_v1(item) -> str | None:
+    """Colore testuale per outfit_score v1 / QuickPair: `effective_color` batte il campo DB."""
+    if not item or not isinstance(item, dict):
+        return None
+    ec = effective_color(item)
+    if ec and str(ec).strip():
+        return ec
+    c = item.get("colore")
+    if c is None or (isinstance(c, str) and not str(c).strip()):
+        return None
+    return str(c).strip()
+
+
 def outfit_score_v2(
     top=None,
     bottom=None,
@@ -1588,7 +1901,8 @@ def outfit_score(
     layer=None,
     prefer_palette: list[str] | None = None,
     target_style: str | None = None,
-    base_item: dict | None = None
+    base_item: dict | None = None,
+    apply_archetype: bool = True,
 ):
     """
     Score totale outfit:
@@ -1602,24 +1916,27 @@ def outfit_score(
     # 1) Compatibilità colore (graduata)
     # =========================
     if piece and shoes:
-        score += color_relation_score(piece.get("colore"), shoes.get("colore")) * 1.4
+        score += color_relation_score(_color_raw_for_score_v1(piece), _color_raw_for_score_v1(shoes)) * 1.4
     if top and bottom:
-        score += color_relation_score(top.get("colore"), bottom.get("colore")) * 1.4
+        score += color_relation_score(_color_raw_for_score_v1(top), _color_raw_for_score_v1(bottom)) * 1.4
     if bottom and shoes:
-        score += color_relation_score(bottom.get("colore"), shoes.get("colore")) * 1.4
+        score += color_relation_score(_color_raw_for_score_v1(bottom), _color_raw_for_score_v1(shoes)) * 1.4
     if top and layer:
-        score += color_relation_score(top.get("colore"), layer.get("colore")) * 0.7
+        score += color_relation_score(_color_raw_for_score_v1(top), _color_raw_for_score_v1(layer)) * 0.7
     if bottom and layer:
-        score += color_relation_score(bottom.get("colore"), layer.get("colore")) * 0.7
+        score += color_relation_score(_color_raw_for_score_v1(bottom), _color_raw_for_score_v1(layer)) * 0.7
     if piece and layer:
-        score += color_relation_score(piece.get("colore"), layer.get("colore")) * 0.7
+        score += color_relation_score(_color_raw_for_score_v1(piece), _color_raw_for_score_v1(layer)) * 0.7
 
     # =========================
     # 2) Bias cromatico
     # =========================
     if prefer_palette:
         for it in (piece, top, bottom, shoes, layer):
-            if it and normalize_color(it.get("colore")) in prefer_palette:
+            if not it:
+                continue
+            raw = _color_raw_for_score_v1(it)
+            if raw and normalize_color(raw) in prefer_palette:
                 score += 0.25
 
     # =========================
@@ -1637,6 +1954,7 @@ def outfit_score(
         score += _score_real_shoes(shoes, style_eff)
         score += _score_real_toplayer(layer, style_eff)
         score += _score_shoes_layer_combo(shoes, layer, style_eff)
+        score += _light_formality_tune(shoes, layer, style_eff)
 
     score += _score_visual_balance(
         top=top,
@@ -1655,6 +1973,13 @@ def outfit_score(
         shoes=shoes,
         layer=layer
     )
+
+    if apply_archetype:
+        score += archetype_combo_bonus(
+            {"top": top, "bottom": bottom, "shoes": shoes, "layer": layer, "piece": piece},
+            target_style,
+            base_item,
+        )
 
     return score
 
@@ -1682,6 +2007,7 @@ def _best_layer_for_outfit(
         prefer_palette=prefer_palette,
         target_style=target_style,
         base_item=base_item,
+        apply_archetype=True,
     )
     if not compat_layers:
         return None, base_sc
@@ -1697,6 +2023,7 @@ def _best_layer_for_outfit(
             prefer_palette=prefer_palette,
             target_style=target_style,
             base_item=base_item,
+            apply_archetype=True,
         )
         if sc > best_sc:
             best_sc = sc
@@ -2982,6 +3309,7 @@ async def quickpair(
 
         _TOP_N = 3
         _SCORE_MARGIN = 1.5
+        _QUICKPAIR_DOMINANCE_GAP = 0.38
         top_candidates = []   # list of (score, candidate), sorted desc, max _TOP_N elements
         rnd = random.Random(time.time())
 
@@ -2989,6 +3317,15 @@ async def quickpair(
             top_candidates.append((score, candidate))
             top_candidates.sort(key=lambda x: x[0], reverse=True)
             del top_candidates[_TOP_N:]
+
+        _QUICKPAIR_SHOE_K = 3
+
+        def _rank_shoe_candidates(compat_s, score_one_shoe):
+            if len(compat_s) <= _QUICKPAIR_SHOE_K:
+                return list(compat_s)
+            ranked = [(score_one_shoe(sh), sh) for sh in compat_s]
+            ranked.sort(key=lambda x: x[0], reverse=True)
+            return [sh for _, sh in ranked[:_QUICKPAIR_SHOE_K]]
 
         if base.get("categoria") == "pezzoUnico":
             for sh in scarpe:
@@ -3016,27 +3353,40 @@ async def quickpair(
                 ]
 
                 compat_s = [s for s in scarpe if are_compatible(b.get("colore"), s.get("colore"))] or scarpe
-                sh = rnd.choice(compat_s)
-                layer, sc = _best_layer_for_outfit(
-                    compat_l,
-                    top=base,
-                    bottom=b,
-                    shoes=sh,
-                    target_style=stile_l,
-                    base_item=base,
-                )
 
-                _upd(
-                    {
-                        "base": base,
-                        "top": base,
-                        "bottom": b,
-                        "layer": layer,
-                        "shoes": sh,
-                        "piece": None
-                    },
-                    sc
-                )
+                def _pre_shoe_topbase(shoe):
+                    return outfit_score(
+                        top=base,
+                        bottom=b,
+                        shoes=shoe,
+                        layer=None,
+                        prefer_palette=None,
+                        target_style=stile_l,
+                        base_item=base,
+                        apply_archetype=False,
+                    )
+
+                for sh in _rank_shoe_candidates(compat_s, _pre_shoe_topbase):
+                    layer, sc = _best_layer_for_outfit(
+                        compat_l,
+                        top=base,
+                        bottom=b,
+                        shoes=sh,
+                        target_style=stile_l,
+                        base_item=base,
+                    )
+
+                    _upd(
+                        {
+                            "base": base,
+                            "top": base,
+                            "bottom": b,
+                            "layer": layer,
+                            "shoes": sh,
+                            "piece": None
+                        },
+                        sc
+                    )
 
         elif base.get("categoria") == "bottom":
             for t in (topBase if len(topBase) <= 25 else rnd.sample(topBase, 25)):
@@ -3050,27 +3400,40 @@ async def quickpair(
                 ]
 
                 compat_s = [s for s in scarpe if are_compatible(base.get("colore"), s.get("colore"))] or scarpe
-                sh = rnd.choice(compat_s)
-                layer, sc = _best_layer_for_outfit(
-                    compat_l,
-                    top=t,
-                    bottom=base,
-                    shoes=sh,
-                    target_style=stile_l,
-                    base_item=base,
-                )
 
-                _upd(
-                    {
-                        "base": base,
-                        "top": t,
-                        "bottom": base,
-                        "layer": layer,
-                        "shoes": sh,
-                        "piece": None
-                    },
-                    sc
-                )
+                def _pre_shoe_bottom(shoe):
+                    return outfit_score(
+                        top=t,
+                        bottom=base,
+                        shoes=shoe,
+                        layer=None,
+                        prefer_palette=None,
+                        target_style=stile_l,
+                        base_item=base,
+                        apply_archetype=False,
+                    )
+
+                for sh in _rank_shoe_candidates(compat_s, _pre_shoe_bottom):
+                    layer, sc = _best_layer_for_outfit(
+                        compat_l,
+                        top=t,
+                        bottom=base,
+                        shoes=sh,
+                        target_style=stile_l,
+                        base_item=base,
+                    )
+
+                    _upd(
+                        {
+                            "base": base,
+                            "top": t,
+                            "bottom": base,
+                            "layer": layer,
+                            "shoes": sh,
+                            "piece": None
+                        },
+                        sc
+                    )
 
         elif base.get("categoria") == "scarpe":
             for p in (pezzo if len(pezzo) <= 30 else rnd.sample(pezzo, 30)):
@@ -3139,52 +3502,77 @@ async def quickpair(
             for t in (topBase if len(topBase) <= 20 else rnd.sample(topBase, 20)):
                 for b in (bottom if len(bottom) <= 20 else rnd.sample(bottom, 20)):
                     compat_s = [s for s in scarpe if are_compatible(b.get("colore"), s.get("colore"))] or scarpe
-                    sh = rnd.choice(compat_s)
 
+                    def _pre_shoe_tl_tb(shoe):
+                        return outfit_score(
+                            top=t,
+                            bottom=b,
+                            shoes=shoe,
+                            layer=base,
+                            prefer_palette=None,
+                            target_style=stile_l,
+                            base_item=base,
+                            apply_archetype=False,
+                        )
+
+                    for sh in _rank_shoe_candidates(compat_s, _pre_shoe_tl_tb):
+                        sc = outfit_score(
+                            top=t,
+                            bottom=b,
+                            shoes=sh,
+                            layer=base,
+                            target_style=stile_l,
+                            base_item=base,
+                            apply_archetype=True,
+                        )
+
+                        _upd(
+                            {
+                                "base": base,
+                                "top": t,
+                                "bottom": b,
+                                "layer": base,
+                                "shoes": sh,
+                                "piece": None
+                            },
+                            sc
+                        )
+
+            for p in (pezzo if len(pezzo) <= 25 else rnd.sample(pezzo, 25)):
+                compat_s = [s for s in scarpe if are_compatible(p.get("colore"), s.get("colore"))] or scarpe
+
+                def _pre_shoe_tl_piece(shoe):
+                    return outfit_score(
+                        piece=p,
+                        shoes=shoe,
+                        layer=base,
+                        prefer_palette=None,
+                        target_style=stile_l,
+                        base_item=base,
+                        apply_archetype=False,
+                    )
+
+                for sh in _rank_shoe_candidates(compat_s, _pre_shoe_tl_piece):
                     sc = outfit_score(
-                        top=t,
-                        bottom=b,
+                        piece=p,
                         shoes=sh,
                         layer=base,
                         target_style=stile_l,
                         base_item=base,
+                        apply_archetype=True,
                     )
 
                     _upd(
                         {
                             "base": base,
-                            "top": t,
-                            "bottom": b,
+                            "piece": p,
                             "layer": base,
                             "shoes": sh,
-                            "piece": None
+                            "top": None,
+                            "bottom": None
                         },
                         sc
                     )
-
-            for p in (pezzo if len(pezzo) <= 25 else rnd.sample(pezzo, 25)):
-                compat_s = [s for s in scarpe if are_compatible(p.get("colore"), s.get("colore"))] or scarpe
-                sh = rnd.choice(compat_s)
-
-                sc = outfit_score(
-                    piece=p,
-                    shoes=sh,
-                    layer=base,
-                    target_style=stile_l,
-                    base_item=base,
-                )
-
-                _upd(
-                    {
-                        "base": base,
-                        "piece": p,
-                        "layer": base,
-                        "shoes": sh,
-                        "top": None,
-                        "bottom": None
-                    },
-                    sc
-                )
 
         else:
             raise HTTPException(
@@ -3207,13 +3595,21 @@ async def quickpair(
             selected_score, best = filtered[0]
             selected_rank = 1
         else:
-            _sc  = [s for s, _ in filtered]
-            _can = [c for _, c in filtered]
-            _min = min(_sc)
-            _w   = [s - _min + 0.1 for s in _sc]   # peso proporzionale, minimo 0.1
-            _idx = rnd.choices(range(len(filtered)), weights=_w, k=1)[0]
-            selected_score, best = filtered[_idx]
-            selected_rank = _idx + 1   # rank 1-based
+            _uniq = sorted({s for s, _ in filtered}, reverse=True)
+            if (
+                len(_uniq) >= 2
+                and (_uniq[0] - _uniq[1]) >= _QUICKPAIR_DOMINANCE_GAP
+            ):
+                selected_score, best = next((s, c) for s, c in filtered if s == _uniq[0])
+                selected_rank = 1
+            else:
+                _sc  = [s for s, _ in filtered]
+                _can = [c for _, c in filtered]
+                _min = min(_sc)
+                _w   = [s - _min + 0.1 for s in _sc]   # peso proporzionale, minimo 0.1
+                _idx = rnd.choices(range(len(filtered)), weights=_w, k=1)[0]
+                selected_score, best = filtered[_idx]
+                selected_rank = _idx + 1   # rank 1-based
 
         print("quickpair best trovato = True")
         print("quickpair best_score =", best_score)
