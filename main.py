@@ -1,7 +1,7 @@
 import json
 import os, uuid, random, time, signal, base64, io
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, File, UploadFile, Form, Query, HTTPException, Body, Request
 from pydantic import BaseModel, Field
@@ -28,6 +28,15 @@ try:
     from google.cloud import vision
 except Exception:
     vision = None
+
+try:
+    from google.oauth2 import service_account as gplay_service_account
+    from googleapiclient.discovery import build as gplay_build
+    from googleapiclient.errors import HttpError as GPlayHttpError
+except Exception:
+    gplay_service_account = None
+    gplay_build = None
+    GPlayHttpError = None
 
 # ====================
 # Funzioni helper
@@ -67,13 +76,9 @@ FIREBASE_BUCKET = os.getenv("FIREBASE_BUCKET", "")
 # Modalità community: TRUE => solo armadi pubblici; gli altri endpoint community rispondono 503
 COMMUNITY_PUBLIC_ONLY = os.getenv("COMMUNITY_PUBLIC_ONLY", "true").lower() == "true"
 
-# IAP: Premium attivabile solo dopo verifica lato store (Google Play / App Store).
-# Finché non implementata / non abilitata: nessuna scrittura isPremium.
-IAP_STORE_VERIFICATION_READY = os.getenv("IAP_STORE_VERIFICATION_READY", "false").lower() in (
-    "true",
-    "1",
-    "yes",
-)
+# IAP Google Play: JSON service account su Render; package pubblicato su Play.
+GOOGLE_PLAY_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON", "").strip()
+ANDROID_PACKAGE_NAME = os.getenv("ANDROID_PACKAGE_NAME", "com.myvogueai.app").strip()
 IAP_PRODUCT_IDS = frozenset({"premium_monthly", "premium_yearly"})
 
 # ------------------------------
@@ -171,6 +176,153 @@ def get_effective_premium_from_firestore(userId: str) -> bool:
         return bool((udoc.to_dict() or {}).get("isPremium", False))
     except Exception:
         return False
+
+
+# ====================
+# IAP — Google Play (subscriptions v2)
+# ====================
+
+_GPLAY_SCOPE = "https://www.googleapis.com/auth/androidpublisher"
+
+
+def _gplay_publisher():
+    """Restituisce il client androidpublisher v3 o None se librerie/JSON assenti."""
+    if not GOOGLE_PLAY_SERVICE_ACCOUNT_JSON or not gplay_build or not gplay_service_account:
+        return None
+    try:
+        sa_info = json.loads(GOOGLE_PLAY_SERVICE_ACCOUNT_JSON)
+    except json.JSONDecodeError:
+        return None
+    try:
+        creds = gplay_service_account.Credentials.from_service_account_info(
+            sa_info, scopes=[_GPLAY_SCOPE]
+        )
+        return gplay_build("androidpublisher", "v3", credentials=creds, cache_discovery=False)
+    except Exception:
+        return None
+
+
+def _parse_rfc3339_utc(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        t = s.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def verify_google_play_subscription(product_id: str, purchase_token: str) -> dict:
+    """
+    Verifica abbonamento con purchases.subscriptionsv2.get.
+    Ritorna dict: success, code, message, subscription_status, premium_until.
+    Non logga purchase_token.
+    """
+    out = {
+        "success": False,
+        "code": "PLAY_VERIFY_FAILED",
+        "message": "Google Play verification failed.",
+        "subscription_status": None,
+        "premium_until": None,
+    }
+    if not ANDROID_PACKAGE_NAME:
+        out["code"] = "PLAY_MISCONFIGURED"
+        out["message"] = "ANDROID_PACKAGE_NAME is not set."
+        return out
+
+    publisher = _gplay_publisher()
+    if publisher is None:
+        out["code"] = "PLAY_MISCONFIGURED"
+        out["message"] = "Google Play credentials are not configured."
+        return out
+
+    if GPlayHttpError is None:
+        out["message"] = "Google API client not available."
+        return out
+
+    try:
+        req = (
+            publisher.purchases()
+            .subscriptionsv2()
+            .get(packageName=ANDROID_PACKAGE_NAME, token=purchase_token)
+        )
+        sub = req.execute()
+    except GPlayHttpError as e:
+        try:
+            status = int(getattr(getattr(e, "resp", None), "status", 0) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status == 404:
+            out["code"] = "PLAY_PURCHASE_NOT_FOUND"
+            out["message"] = "Purchase not found for this app."
+        elif status in (401, 403):
+            out["code"] = "PLAY_PERMISSION_DENIED"
+            out["message"] = "Google Play API permission denied."
+        else:
+            out["code"] = "PLAY_VERIFY_FAILED"
+            out["message"] = "Google Play API error."
+        return out
+    except Exception:
+        out["message"] = "Google Play verification error."
+        return out
+
+    sub_state = (sub.get("subscriptionState") or "").strip() or None
+    out["subscription_status"] = sub_state
+
+    line_items = sub.get("lineItems") or []
+    if not isinstance(line_items, list):
+        line_items = []
+
+    matching_expiries: list[datetime] = []
+    for li in line_items:
+        if not isinstance(li, dict):
+            continue
+        lid = (li.get("productId") or "").strip()
+        if lid != product_id:
+            continue
+        exp = _parse_rfc3339_utc(li.get("expiryTime"))
+        if exp:
+            matching_expiries.append(exp)
+
+    if not matching_expiries:
+        out["code"] = "PLAY_PRODUCT_MISMATCH"
+        out["message"] = "Subscription does not include this product."
+        return out
+
+    premium_until = max(matching_expiries)
+    out["premium_until"] = premium_until
+    now = datetime.now(timezone.utc)
+
+    if sub_state == "SUBSCRIPTION_STATE_EXPIRED":
+        out["code"] = "PLAY_SUBSCRIPTION_EXPIRED"
+        out["message"] = "Subscription expired."
+        return out
+    if sub_state == "SUBSCRIPTION_STATE_PAUSED":
+        out["code"] = "PLAY_SUBSCRIPTION_PAUSED"
+        out["message"] = "Subscription is paused."
+        return out
+
+    if premium_until <= now:
+        out["code"] = "PLAY_SUBSCRIPTION_EXPIRED"
+        out["message"] = "Subscription period ended."
+        return out
+
+    if sub_state not in (
+        "SUBSCRIPTION_STATE_ACTIVE",
+        "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
+        "SUBSCRIPTION_STATE_CANCELED",
+    ):
+        out["code"] = "PLAY_SUBSCRIPTION_NOT_ACTIVE"
+        out["message"] = "Subscription state is not eligible."
+        return out
+
+    out["success"] = True
+    out["code"] = "OK"
+    out["message"] = "Verified with Google Play."
+    return out
 
 
 def avoid_recent(items, recent_ids):
@@ -2262,21 +2414,28 @@ class IapVerifyBody(BaseModel):
 @app.post("/iap/verify")
 async def iap_verify(request: Request, body: IapVerifyBody):
     """
-    Verifica Firebase ID token + whitelist prodotto; grant Premium solo dopo
-    verifica reale con lo store (Google Play / Apple). TODO: chiamate API store.
+    Verifica Firebase ID token + Google Play subscriptions v2; grant solo se valido.
     """
     auth_header = request.headers.get("Authorization") or ""
     prefix = "Bearer "
     if not auth_header.startswith(prefix):
         return JSONResponse(
             status_code=401,
-            content={"granted": False, "code": "MISSING_OR_INVALID_AUTHORIZATION"},
+            content={
+                "granted": False,
+                "code": "MISSING_OR_INVALID_AUTHORIZATION",
+                "message": "Missing bearer token.",
+            },
         )
     id_token = auth_header[len(prefix) :].strip()
     if not id_token:
         return JSONResponse(
             status_code=401,
-            content={"granted": False, "code": "MISSING_OR_INVALID_AUTHORIZATION"},
+            content={
+                "granted": False,
+                "code": "MISSING_OR_INVALID_AUTHORIZATION",
+                "message": "Empty bearer token.",
+            },
         )
 
     try:
@@ -2285,45 +2444,108 @@ async def iap_verify(request: Request, body: IapVerifyBody):
         if not uid:
             return JSONResponse(
                 status_code=401,
-                content={"granted": False, "code": "INVALID_FIREBASE_TOKEN"},
+                content={
+                    "granted": False,
+                    "code": "INVALID_FIREBASE_TOKEN",
+                    "message": "Invalid token payload.",
+                },
             )
     except Exception:
         return JSONResponse(
             status_code=401,
-            content={"granted": False, "code": "INVALID_FIREBASE_TOKEN"},
+            content={
+                "granted": False,
+                "code": "INVALID_FIREBASE_TOKEN",
+                "message": "Invalid Firebase ID token.",
+            },
         )
 
     if body.productId not in IAP_PRODUCT_IDS:
         return JSONResponse(
             status_code=200,
-            content={"granted": False, "code": "INVALID_PRODUCT_ID"},
+            content={
+                "granted": False,
+                "code": "INVALID_PRODUCT_ID",
+                "message": "Product is not allowed.",
+            },
         )
 
     store_token = (body.purchaseToken or body.verificationData or "").strip()
     if not store_token:
         return JSONResponse(
             status_code=200,
-            content={"granted": False, "code": "MISSING_PURCHASE_TOKEN"},
+            content={
+                "granted": False,
+                "code": "MISSING_PURCHASE_TOKEN",
+                "message": "Missing purchase token.",
+            },
         )
 
-    # TODO: chiamare Google Play Developer API / Apple App Store Server API usando
-    # store_token, body.productId, uid (e purchaseId se serve). Nessun grant senza risposta store valida.
-
-    print(
-        f"=== /iap/verify uid={uid} productId={body.productId} "
-        f"platform={body.platform!r} iap_ready={IAP_STORE_VERIFICATION_READY} ==="
-    )
-
-    if not IAP_STORE_VERIFICATION_READY:
+    src = (body.source or body.platform or "").strip().lower()
+    if src and src != "google_play":
         return JSONResponse(
             status_code=200,
-            content={"granted": False, "code": "IAP_VERIFICATION_NOT_CONFIGURED"},
+            content={
+                "granted": False,
+                "code": "PLATFORM_NOT_SUPPORTED",
+                "message": "Only google_play is supported for verification.",
+            },
         )
 
-    # Implementazione futura: verifica store + Admin SDK su users/{uid}
+    if not GOOGLE_PLAY_SERVICE_ACCOUNT_JSON:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "granted": False,
+                "code": "IAP_VERIFICATION_NOT_CONFIGURED",
+                "message": "Google Play service account is not configured on the server.",
+            },
+        )
+
+    print(f"=== /iap/verify uid={uid} productId={body.productId} package={ANDROID_PACKAGE_NAME!r} ===")
+
+    v = verify_google_play_subscription(body.productId, store_token)
+    if not v["success"]:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "granted": False,
+                "code": v["code"],
+                "message": v["message"],
+            },
+        )
+
+    token_hash = sha256(store_token.encode("utf-8")).hexdigest()
+    premium_until = v["premium_until"]
+    try:
+        ref = db.collection("users").document(uid)
+        update = {
+            "isPremium": True,
+            "subscriptionStatus": v.get("subscription_status"),
+            "lastProductId": body.productId,
+            "purchaseTokenHash": token_hash,
+            "premiumUpdatedAt": firestore.SERVER_TIMESTAMP,
+        }
+        if premium_until is not None:
+            update["premiumUntil"] = premium_until
+        ref.set(update, merge=True)
+    except Exception:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "granted": False,
+                "code": "FIRESTORE_WRITE_FAILED",
+                "message": "Could not save subscription state.",
+            },
+        )
+
     return JSONResponse(
         status_code=200,
-        content={"granted": False, "code": "IAP_VERIFICATION_NOT_CONFIGURED"},
+        content={
+            "granted": True,
+            "code": "OK",
+            "message": v.get("message") or "Premium activated.",
+        },
     )
 
 
