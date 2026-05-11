@@ -2695,11 +2695,33 @@ def _is_valid_outfit(o: dict) -> bool:
     return count >= 2
 
 
+def require_uid_match(request: Request, user_id: str) -> str:
+    """Verifica Authorization: Bearer <firebase_id_token> e che uid == user_id."""
+    auth_header = request.headers.get("Authorization") or ""
+    prefix = "Bearer "
+    if not auth_header.startswith(prefix):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    id_token = auth_header[len(prefix) :].strip()
+    if not id_token:
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired Firebase ID token.")
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Invalid or expired Firebase ID token.")
+    if uid != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden: userId does not match authenticated user.")
+    return uid
+
+
 # ------------------------------
 # 13) /outfit — scelta colori + varietà (con lingua + quota + premium)
 # ------------------------------
 @app.get("/outfit")
 async def genera_outfit(
+    request: Request,
     stile: str = Query(None, description="Ignorato per utenti free; usato solo per premium."),
     stagione: str = Query(...),
     userId: str = Query(...),
@@ -2715,6 +2737,7 @@ async def genera_outfit(
     excludeIds: str = Query("", description="comma-separated item ids to avoid"),
     refreshSeed: str = Query("", description="seed opzionale per refresh deterministico"),
 ):
+    require_uid_match(request, userId)
     # parsing veloce (Punti 2 e 4)
     prefer_palette = [normalize_color(c) for c in (preferColors or "").split(",") if c.strip()]
     exclude_set = set([x.strip() for x in (excludeIds or "").split(",") if x.strip()])
@@ -3471,11 +3494,13 @@ def safe_gpt_text(prompt: str, max_tokens: int = 120, temperature: float = 0.8, 
 # ------------------------------
 @app.get("/quickpair")
 async def quickpair(
+    request: Request,
     userId: str = Query(...),
     baseId: str = Query(..., description="document id di clothingItems"),
     stagione: str = Query(...),
     lang: str = Query(None),
 ):
+    require_uid_match(request, userId)
     try:
         stagione_l = normalize_stagione(stagione)
         lang = (lang or get_user_lang(userId, "it")).lower()
