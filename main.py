@@ -111,9 +111,10 @@ if vision is not None:
 # 8) UTILS — Funzioni AI + SafeSearch
 # ------------------------------
 
-# Limite free configurabile via env (default = 8 outfit al giorno)
+# Legacy/env-only: usato solo se qualcosa chiamasse check_and_increment_quota_or_raise(feature="outfit").
+# Il flusso GET /outfit FREE reale usa reserve_free_daily_or_raise (1 look/giorno, chiave freeDaily), non questo numero.
 FREE_OUTFIT_LIMIT = int(os.getenv("FREE_OUTFIT_LIMIT", "8"))
-QUICKPAIR_FREE_DAILY_LIMIT = int(os.getenv("QUICKPAIR_FREE_DAILY_LIMIT", "2"))  # max 2 suggerimenti/giorno per FREE
+QUICKPAIR_FREE_DAILY_LIMIT = int(os.getenv("QUICKPAIR_FREE_DAILY_LIMIT", "2"))  # free: max 2 QuickPair/giorno (feature "quickpair")
 
 
 def check_and_increment_quota_or_raise(userId: str, feature: str, limit_free: int | None = None):
@@ -121,6 +122,7 @@ def check_and_increment_quota_or_raise(userId: str, feature: str, limit_free: in
     Controlla e incrementa la quota giornaliera per una feature.
     Se superata, solleva HTTPException 429 con payload JSON strutturato.
     """
+    # Nota: nessun caller attuale usa feature="outfit"; FREE outfit usa freeDaily (vedi reserve_free_daily_or_raise).
     limit = limit_free if limit_free is not None else (
         FREE_OUTFIT_LIMIT if feature == "outfit" else 999999
     )
@@ -967,6 +969,251 @@ def _pattern_mix_penalty(top=None, bottom=None, piece=None, shoes=None, layer=No
     if non_solid >= 2:
         return -0.45
     return 0.0
+
+
+_VALID_QUICKPAIR_OCCASIONS = frozenset({
+    "everyday", "work", "evening", "elegant", "casual", "rainy", "cold", "warm",
+})
+
+
+def _normalize_quickpair_occasion(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    return s if s in _VALID_QUICKPAIR_OCCASIONS else None
+
+
+def _occasion_items_blob(
+    *,
+    top=None,
+    bottom=None,
+    piece=None,
+    layer=None,
+    shoes=None,
+) -> str:
+    chunks: list[str] = []
+    for it in (piece, top, bottom, layer, shoes):
+        if not it or not isinstance(it, dict):
+            continue
+        nome = str(it.get("nome") or "").lower()
+        cat = str(it.get("categoria") or "").lower()
+        chunks.append(f"{cat} {nome}")
+    return " ".join(chunks)
+
+
+def _score_occasion_fit(
+    *,
+    top=None,
+    bottom=None,
+    piece=None,
+    layer=None,
+    shoes=None,
+    occasion: str | None,
+) -> float:
+    """Piccolo aggiustamento (-1.5 … +1.5) per contesto QuickPair; occasion=None → 0."""
+    if not occasion:
+        return 0.0
+    b = _occasion_items_blob(top=top, bottom=bottom, piece=piece, layer=layer, shoes=shoes).lower()
+
+    def has(*needles: str) -> bool:
+        return any(n in b for n in needles)
+
+    sc = 0.0
+
+    if occasion in {"work", "elegant", "evening"}:
+        if has("running", "runner", "track", "training", "ginnastic", "tennis", "trail"):
+            sc -= 0.85
+        if has("felpa", "hoodie", "cappuccio", "tuta", "leggings"):
+            sc -= 0.55
+        if has("blazer", "camicia"):
+            sc += 0.45
+        if has("mocassin", "mocassino", "loafer", "oxford", "derby", "décolleté", "decollete", "tacco"):
+            sc += 0.5
+
+    if occasion == "evening":
+        if has("blazer", "vestito", "abito"):
+            sc += 0.35
+
+    if occasion in {"casual", "everyday"}:
+        if has("jeans", "denim", "t-shirt", "tshirt", "maglietta", "sneaker", "sneakers"):
+            sc += 0.35
+        if has("pigiama", "slides", "ciabatte", "ciabatta"):
+            sc -= 0.55
+
+    if occasion == "rainy":
+        if has("stival", "anfibio", "rain", "trench", "impermeabile", "goretex", "gomma"):
+            sc += 0.75
+        if has("sandalo", "sandali", "zeppa", "slides", "ciabatta"):
+            sc -= 0.85
+
+    if occasion == "cold":
+        if layer is not None:
+            sc += 0.45
+        if has("cappotto", "piumino", "parka", "maglion", "pile", "cardigan", "lana"):
+            sc += 0.5
+
+    if occasion == "warm":
+        if layer is not None and has("cappotto", "piumino", "parka", "shearling", "pelliccia", "imbottito"):
+            sc -= 0.75
+
+    return max(-1.5, min(1.5, sc))
+
+
+def _collect_outfit_colors_and_items(outfit_parts: dict) -> tuple[list[str], list[dict]]:
+    colors: list[str] = []
+    items: list[dict] = []
+    for key in ("pezzoUnico", "top", "bottom", "layer", "shoes"):
+        it = outfit_parts.get(key)
+        if not it or not isinstance(it, dict):
+            continue
+        items.append(it)
+        raw = _color_raw_for_score_v1(it)
+        if raw:
+            nc = normalize_color(raw)
+            if nc != "sconosciuto":
+                colors.append(nc)
+    return colors, items
+
+
+def _styling_reason_fallback_lang(lang: str) -> str:
+    lc = (lang or "it").lower()
+    if lc.startswith("en"):
+        return "A balanced mix of your pieces, tuned so colors and proportions work together."
+    if lc.startswith("es"):
+        return "Una mezcla equilibrada de tus prendas, afinada para que color y proporciones encajen."
+    return "Un equilibrio tra i tuoi capi, calibrato perché colori e proporzioni funzionino insieme."
+
+
+def _build_styling_reason(
+    outfit_parts: dict,
+    *,
+    target_style: str | None,
+    lang: str,
+    base_item: dict | None = None,
+) -> str:
+    """Breve spiegazione locale (no GPT), backward-compatible."""
+    lc = (lang or "it").lower()
+    if lc.startswith("en"):
+        lang_code = "en"
+    elif lc.startswith("es"):
+        lang_code = "es"
+    else:
+        lang_code = "it"
+
+    def T(it_txt: str, en_txt: str, es_txt: str) -> str:
+        if lang_code == "en":
+            return en_txt
+        if lang_code == "es":
+            return es_txt
+        return it_txt
+
+    try:
+        colors, items = _collect_outfit_colors_and_items(outfit_parts)
+        if not items:
+            return _styling_reason_fallback_lang(lang)
+
+        neutrals = {"nero", "bianco", "grigio", "beige", "avorio", "marrone", "crema", "cammello"}
+        accents = {"rosso", "rosa", "lilla", "verde", "oliva", "giallo", "senape", "arancione", "bordeaux", "azzurro", "blu", "fucsia"}
+
+        navy_like = any(c == "navy" for c in colors)
+        neutral_count = sum(1 for c in colors if c in neutrals)
+        accent_count = sum(1 for c in colors if c in accents)
+
+        shoes = outfit_parts.get("shoes")
+        layer = outfit_parts.get("layer")
+        piece = outfit_parts.get("pezzoUnico")
+
+        shoe_light = False
+        if shoes:
+            scol = normalize_color(_color_raw_for_score_v1(shoes) or "")
+            shoe_light = scol in {"bianco", "avorio", "beige", "crema"}
+
+        layer_nm = str((layer or {}).get("nome") or "").lower()
+        formal_layer = layer and any(
+            k in layer_nm for k in ("blazer", "giacca", "soprabito", "cappotto", "trench")
+        )
+
+        if base_item and isinstance(base_item, dict):
+            bn = str(base_item.get("nome") or "").strip()
+            bc_raw = _color_raw_for_score_v1(base_item) or base_item.get("colore") or ""
+            bc = normalize_color(bc_raw) if bc_raw else ""
+            color_hint = f" ({bc})" if bc and bc != "sconosciuto" else ""
+            if bn:
+                if navy_like and shoe_light:
+                    return T(
+                        f"Intorno a {bn}{color_hint}, il navy tiene il look ordinato mentre le scarpe chiare lo rendono più fresco.",
+                        f"Around {bn}{color_hint}, navy keeps the palette tidy while lighter shoes freshen the result.",
+                        f"Con {bn}{color_hint}, el navy mantiene el conjunto ordenado y el calzado claro lo aligera.",
+                    )
+                if layer:
+                    return T(
+                        f"Intorno a {bn}, il secondo strato completa la silhouette senza appesantire i colori.",
+                        f"Around {bn}, the extra layer finishes the silhouette without weighing down the palette.",
+                        f"Con {bn}, la capa extra cierra la silueta sin cargar los colores.",
+                    )
+                return T(
+                    f"Intorno a {bn}, tonalità e proporzioni restano bilanciate per un abbinamento credibile.",
+                    f"Around {bn}, tones and proportions stay balanced for a believable pairing.",
+                    f"Con {bn}, tonos y proporciones se mantienen equilibrados para un conjunto creíble.",
+                )
+
+        if formal_layer:
+            return T(
+                "Il capo spalla dà struttura al look, mentre pantaloni e scarpe mantengono il ritmo cromatico ordinato.",
+                "The shoulder piece structures the look, while pants and shoes keep the color rhythm clean.",
+                "La prenda de hombro estructura el look, mientras pantalón y zapatos mantienen el color ordenado.",
+            )
+
+        if navy_like:
+            return T(
+                "Il navy resta protagonista della palette, con gli altri elementi che lo supportano senza rumore visivo.",
+                "Navy anchors the palette, with the other pieces supporting it without visual noise.",
+                "El navy centra la paleta y el resto apoya sin ruido visual.",
+            )
+
+        if neutral_count >= 2 and accent_count == 1:
+            return T(
+                "La base neutra tiene pulito l'outfit e l'accento di colore scala il risultato senza stravolgerlo.",
+                "A neutral base keeps the outfit clean, and the color accent lifts it without overpowering.",
+                "La base neutra mantiene limpio el conjunto y el toque de color lo eleva sin dominar.",
+            )
+
+        if shoe_light and len(colors) >= 2:
+            return T(
+                "Le scarpe chiare alleggeriscono il look e bilanciano i toni più marcati degli altri capi.",
+                "Light shoes brighten the look and balance stronger tones from the other pieces.",
+                "El calzado claro aligera el look y equilibra tonos más marcados del resto.",
+            )
+
+        style_eff = normalize_stile(target_style) or ""
+
+        if layer and piece:
+            return T(
+                "Il pezzo unico resta al centro e il layer aggiunge profondità senza competere con la silhouette.",
+                "The one-piece stays central and the layer adds depth without fighting the silhouette.",
+                "La pieza única mantiene el foco y la capa añade profundidad sin competir con la silueta.",
+            )
+
+        if layer and style_eff in {"casual", "streetwear", "sportivo"}:
+            return T(
+                "Il layering aiuta a giocare con texture e volumi mantenendo coerenti scarpe e pantalone.",
+                "Layering plays with texture and volume while keeping shoes and trousers coherent.",
+                "El capas juega con textura y volumen manteniendo zapato y pantalón coherentes.",
+            )
+
+        shoe_nm = str((shoes or {}).get("nome") or "").lower()
+        if style_eff == "elegante" and shoes and any(
+            k in shoe_nm for k in ("mocassin", "mocassino", "loafer", "tacco", "decollete", "décolleté")
+        ):
+            return T(
+                "Scarpe più pulite e linee classiche mantengono il look elegante ma ancora portabile ogni giorno.",
+                "Cleaner shoes and classic lines keep the outfit refined without feeling overly stiff.",
+                "Zapatos sobrios y líneas clásicas mantienen el look elegante sin resultar rígido.",
+            )
+
+        return _styling_reason_fallback_lang(lang)
+    except Exception:
+        return _styling_reason_fallback_lang(lang)
 
 
 def _score_base_item_fit(
@@ -2908,7 +3155,7 @@ async def genera_outfit(
     userId: str = Query(...),
     lang: str = Query(None),
     premium: bool = Query(False),
-    charge: bool = Query(False),  # tenuto per retro-compatibilità; ignorato per free-daily
+    charge: bool = Query(False),  # legacy client flag; il ramo free usa solo freeDaily (non incrementa quote "outfit")
 
     # === Parametri opzionali retro-compatibili (Punto 2) ===
     maxOutfits: int = Query(3, ge=1, le=3),   # premium: quanti outfit provare a restituire
@@ -3297,6 +3544,17 @@ async def genera_outfit(
                 )
                 if sid:
                     scelta["suggestionId"] = sid
+                scelta["stylingReason"] = _build_styling_reason(
+                    {
+                        "pezzoUnico": o["pezzoUnico"],
+                        "top": o["top"],
+                        "bottom": o["bottom"],
+                        "layer": o["layer"],
+                        "shoes": o["shoes"],
+                    },
+                    target_style=stile_l_req,
+                    lang=lang,
+                )
                 outfits_payload.append(scelta)
 
 
@@ -3599,10 +3857,22 @@ async def genera_outfit(
             if sid_free:
                 payload["suggestionId"] = sid_free
 
+            payload["stylingReason"] = _build_styling_reason(
+                {
+                    "pezzoUnico": best["pezzoUnico"],
+                    "top": best["top"],
+                    "bottom": best["bottom"],
+                    "layer": best["layer"],
+                    "shoes": best["shoes"],
+                },
+                target_style=stile_l,
+                lang=lang,
+            )
+
             # Compact mode per il ramo free (Punto 7 — facoltativo)
             if compact:
                 for k in list(payload.keys()):
-                    if k not in ("pezzoUnicoImage","topImage","bottomImage","topLayerImage","scarpeImage","descrizione","lang","freeDaily","premium","suggestionId"):
+                    if k not in ("pezzoUnicoImage","topImage","bottomImage","topLayerImage","scarpeImage","descrizione","lang","freeDaily","premium","suggestionId","stylingReason"):
                         payload.pop(k, None)
 
             write_cached_daily_outfit(userId, payload, meta)
@@ -3703,6 +3973,10 @@ async def quickpair(
     baseId: str = Query(..., description="document id di clothingItems"),
     stagione: str = Query(...),
     lang: str = Query(None),
+    occasion: str = Query(
+        "",
+        description="Optional context (TODO: Flutter UI): everyday|work|evening|elegant|casual|rainy|cold|warm.",
+    ),
 ):
     require_uid_match(request, userId)
     try:
@@ -3855,8 +4129,23 @@ async def quickpair(
         top_candidates = []   # list of (score, candidate), sorted desc, max _TOP_N elements
         rnd = random.Random(time.time())
 
+        occasion_n = _normalize_quickpair_occasion((occasion or "").strip() or None)
+
+        def _occasion_bonus_qp(cand: dict) -> float:
+            if not occasion_n:
+                return 0.0
+            return _score_occasion_fit(
+                top=cand.get("top"),
+                bottom=cand.get("bottom"),
+                piece=cand.get("piece"),
+                layer=cand.get("layer"),
+                shoes=cand.get("shoes"),
+                occasion=occasion_n,
+            )
+
         def _upd(candidate, score):
-            top_candidates.append((score, candidate))
+            adj = score + _occasion_bonus_qp(candidate)
+            top_candidates.append((adj, candidate))
             top_candidates.sort(key=lambda x: x[0], reverse=True)
             del top_candidates[_TOP_N:]
 
@@ -4289,6 +4578,13 @@ async def quickpair(
         )
         if sid_qp:
             payload["suggestionId"] = sid_qp
+
+        payload["stylingReason"] = _build_styling_reason(
+            outfit_for_log,
+            target_style=stile_l,
+            lang=lang,
+            base_item=base,
+        )
 
         return JSONResponse(content=payload)
 
