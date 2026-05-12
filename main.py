@@ -510,24 +510,26 @@ BASIC_COLORS = {
 
     # estesi dalla UI
     "giallo":      ["blu", "bianco", "grigio", "verde", "nero", "beige"],
-    "marrone":     ["bianco", "beige", "verde", "blu", "grigio", "oliva"],
+    "marrone":     ["bianco", "beige", "verde", "blu", "grigio", "oliva", "senape", "arancione", "rosso"],
     "rosa":        ["bianco", "grigio", "blu", "nero", "beige"],
     "lilla":       ["bianco", "grigio", "blu", "nero"],
     "azzurro":     ["bianco", "beige", "grigio", "blu"],
-    "oliva":       ["beige", "bianco", "nero", "marrone", "grigio"],
+    "oliva":       ["beige", "bianco", "nero", "marrone", "grigio", "senape", "arancione"],
     "bordeaux":    ["bianco", "nero", "beige", "grigio", "rosa"],
     "arancione":   ["blu", "bianco", "grigio", "nero", "beige"],
     "senape":      ["blu", "bianco", "grigio", "verde", "beige"],
     "avorio":      ["nero", "blu", "rosso", "verde", "beige", "grigio"],
+    # navy: separato da blu generico (sinonimi in COLOR_SYNONYMS); abbinamenti classici premium
+    "navy":        ["bianco", "beige", "grigio", "avorio", "marrone", "nero"],
     # trattiamo multicolore come neutro “aperto” per massimizzare gli abbinamenti
     "multicolore": ["nero", "bianco", "blu", "rosso", "verde", "beige", "grigio", "marrone", "azzurro"],
 }
 
 # Mappa sinonimi/varianti -> colore canonico della palette sopra
 COLOR_SYNONYMS = {
-    # blu e navy
-    "blu navy":          "blu",
-    "navy":              "blu",
+    # blu e navy (navy è canonico separato; vedi BASIC_COLORS["navy"])
+    "blu navy":          "navy",
+    "navy":              "navy",
     "blu scuro":         "blu",
     "blu chiaro":        "azzurro",
     "celeste":           "azzurro",
@@ -917,7 +919,7 @@ def _score_visual_balance(top=None, bottom=None, piece=None, shoes=None, layer=N
         elif unique_neutral == 2:
             pass            # tonal duo neutro: né bonus né malus
         else:
-            score -= 0.3    # tre neutri diversi senza accento: lieve piattezza
+            score -= 1.2    # tre neutri diversi senza accento: look troppo piatto (non tocca monocromie già premiate sotto)
 
     if neutral_count >= 2 and accent_count == 1:
         score += 1.4
@@ -946,6 +948,25 @@ def _score_visual_balance(top=None, bottom=None, piece=None, shoes=None, layer=N
         score += 0.6
 
     return score
+
+
+def _pattern_mix_penalty(top=None, bottom=None, piece=None, shoes=None, layer=None) -> float:
+    """Opzionale: se il campo pattern è presente, penalizza 2+ motivi non tinta unita. Senza campo = neutral (retro-compat)."""
+    solids = frozenset({"unito", "solid", "tinta unita", "tinta unità", "plain", "liscio"})
+    non_solid = 0
+    for it in (top, bottom, piece, shoes, layer):
+        if not it:
+            continue
+        raw = it.get("pattern")
+        if raw is None or str(raw).strip() == "":
+            continue
+        p = str(raw).strip().lower()
+        if p in solids:
+            continue
+        non_solid += 1
+    if non_solid >= 2:
+        return -0.45
+    return 0.0
 
 
 def _score_base_item_fit(
@@ -2072,6 +2093,12 @@ def outfit_score(
     1) compatibilità colore
     2) piccolo bias su palette preferita
     3) peso stilistico reale di scarpe e topLayer
+
+    Golden set futuro (regressione qualità): mantenere 30–50 outfit noti valutati 10/10 e
+    rilanciare lo scoring dopo ogni tweak; non richiede implementazione ora (evitare script/framework pesanti).
+
+    TODO(future diversity): penalità ripetizione itemIds vs storico, forzare 2–3 alternative,
+    diversità silhouette — solo se senza query Firestore extra o refactor ampio (oggi: avoid_recent / excludeIds / refreshSeed).
     """
     score = 0.0
 
@@ -2137,6 +2164,12 @@ def outfit_score(
         layer=layer
     )
 
+    if base_item and target_style:
+        base_style = normalize_stile(base_item.get("stile"))
+        target_norm = normalize_stile(target_style)
+        if base_style and target_norm and base_style != target_norm:
+            score -= 1.5
+
     if apply_archetype:
         score += archetype_combo_bonus(
             {"top": top, "bottom": bottom, "shoes": shoes, "layer": layer, "piece": piece},
@@ -2144,10 +2177,12 @@ def outfit_score(
             base_item,
         )
 
+    score += _pattern_mix_penalty(top, bottom, piece, shoes, layer)
+
     return score
 
 
-_LAYER_MIN_GAIN = 0.25
+_LAYER_MIN_GAIN = 0.08
 
 
 def _best_layer_for_outfit(
@@ -2716,6 +2751,152 @@ def require_uid_match(request: Request, user_id: str) -> str:
     return uid
 
 
+def require_firebase_uid(request: Request) -> str:
+    """Bearer Firebase ID token → uid (senza confronto con query userId)."""
+    auth_header = request.headers.get("Authorization") or ""
+    prefix = "Bearer "
+    if not auth_header.startswith(prefix):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    id_token = auth_header[len(prefix) :].strip()
+    if not id_token:
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired Firebase ID token.")
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Invalid or expired Firebase ID token.")
+    return uid
+
+
+def _log_outfit_suggestion_safe(
+    *,
+    user_id: str,
+    source: str,
+    outfit_parts: dict,
+    style: str | None = None,
+    season: str | None = None,
+    is_premium: bool | None = None,
+    base_item_id: str | None = None,
+    base_category: str | None = None,
+    score: float | None = None,
+) -> str | None:
+    """
+    Best-effort: scrive outfitSuggestions/{autoId}. Non propagare eccezioni.
+    outfit_parts usa chiavi come _is_valid_outfit: pezzoUnico, top, bottom, layer, shoes.
+    """
+    try:
+        if source not in ("outfit", "quickpair"):
+            return None
+        order = ("pezzoUnico", "top", "bottom", "layer", "shoes")
+        item_ids: list[str] = []
+        categories: list[str] = []
+        colors: list[str] = []
+        for key in order:
+            it = outfit_parts.get(key)
+            if not it:
+                continue
+            raw_id = it.get("docId") or it.get("id")
+            if raw_id:
+                item_ids.append(str(raw_id))
+            cat = it.get("categoria")
+            if cat:
+                categories.append(str(cat))
+            rc = _color_raw_for_score_v1(it)
+            if rc:
+                nc = normalize_color(rc)
+                if nc and nc != "sconosciuto":
+                    colors.append(nc)
+        sty = style.strip() if style else None
+        sea = season.strip() if season else None
+        doc_ref = db.collection("outfitSuggestions").document()
+        doc_ref.set({
+            "userId": user_id,
+            "source": source,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "style": sty,
+            "stile": sty,
+            "season": sea,
+            "stagione": sea,
+            "isPremium": is_premium,
+            "baseItemId": base_item_id,
+            "baseCategory": base_category,
+            "itemIds": item_ids,
+            "categories": categories,
+            "colors": colors,
+            "score": score,
+            "status": "shown",
+            "feedback": None,
+            "feedbackReason": None,
+            "acceptedAt": None,
+            "ignoredAt": None,
+            "regeneratedAt": None,
+            "version": "styling_v1",
+        })
+        return doc_ref.id
+    except Exception as ex:
+        print(f"[outfitSuggestions] log skipped: {ex}")
+        return None
+
+
+OUTFIT_FEEDBACK_ACTIONS = frozenset({"accepted", "ignored", "regenerated"})
+OUTFIT_FEEDBACK_REASONS = frozenset({
+    "too_casual",
+    "too_formal",
+    "colors_bad",
+    "colors_good_fit_bad",
+    "shoes_wrong",
+    "already_seen",
+    "other",
+})
+
+
+class OutfitFeedbackIn(BaseModel):
+    suggestionId: str = Field(..., min_length=1)
+    action: str
+    reason: str | None = None
+
+
+@app.post("/outfit_feedback")
+async def outfit_feedback(request: Request, body: OutfitFeedbackIn):
+    uid = require_firebase_uid(request)
+    action = (body.action or "").strip()
+    if action not in OUTFIT_FEEDBACK_ACTIONS:
+        raise HTTPException(status_code=400, detail="Invalid action.")
+    reason = body.reason
+    if reason is not None:
+        reason = str(reason).strip()
+        if reason == "":
+            reason = None
+        elif reason not in OUTFIT_FEEDBACK_REASONS:
+            raise HTTPException(status_code=400, detail="Invalid reason.")
+
+    sid = body.suggestionId.strip()
+    ref = db.collection("outfitSuggestions").document(sid)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Suggestion not found.")
+    data = snap.to_dict() or {}
+    if data.get("userId") != uid:
+        raise HTTPException(status_code=403, detail="Forbidden.")
+
+    upd: dict = {
+        "feedback": action,
+        "feedbackReason": reason,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    if action == "accepted":
+        upd["acceptedAt"] = firestore.SERVER_TIMESTAMP
+    elif action == "ignored":
+        upd["ignoredAt"] = firestore.SERVER_TIMESTAMP
+    else:
+        upd["regeneratedAt"] = firestore.SERVER_TIMESTAMP
+    ref.update(upd)
+    return JSONResponse(content={"ok": True})
+
+
 # ------------------------------
 # 13) /outfit — scelta colori + varietà (con lingua + quota + premium)
 # ------------------------------
@@ -3105,6 +3286,17 @@ async def genera_outfit(
                 scelta["descrizione"] = description
                 scelta["consiglioExtra"] = consiglio_extra
                 scelta["lang"] = lang
+                sid = _log_outfit_suggestion_safe(
+                    user_id=userId,
+                    source="outfit",
+                    outfit_parts=o,
+                    style=stile_l_req,
+                    season=stagione_l,
+                    is_premium=True,
+                    score=c.get("score"),
+                )
+                if sid:
+                    scelta["suggestionId"] = sid
                 outfits_payload.append(scelta)
 
 
@@ -3395,10 +3587,22 @@ async def genera_outfit(
             }
             payload["premium"] = False
 
+            sid_free = _log_outfit_suggestion_safe(
+                user_id=userId,
+                source="outfit",
+                outfit_parts=best,
+                style=stile_l,
+                season=stagione_l,
+                is_premium=False,
+                score=best_score,
+            )
+            if sid_free:
+                payload["suggestionId"] = sid_free
+
             # Compact mode per il ramo free (Punto 7 — facoltativo)
             if compact:
                 for k in list(payload.keys()):
-                    if k not in ("pezzoUnicoImage","topImage","bottomImage","topLayerImage","scarpeImage","descrizione","lang","freeDaily","premium"):
+                    if k not in ("pezzoUnicoImage","topImage","bottomImage","topLayerImage","scarpeImage","descrizione","lang","freeDaily","premium","suggestionId"):
                         payload.pop(k, None)
 
             write_cached_daily_outfit(userId, payload, meta)
@@ -3774,6 +3978,7 @@ async def quickpair(
                     )
 
         elif base.get("categoria") == "scarpe":
+            scarpe_pool = []
             for p in (pezzo if len(pezzo) <= 30 else rnd.sample(pezzo, 30)):
                 if not are_compatible(p.get("colore"), base.get("colore")):
                     continue
@@ -3790,17 +3995,17 @@ async def quickpair(
                     base_item=base,
                 )
 
-                _upd(
+                scarpe_pool.append((
+                    sc,
                     {
                         "base": base,
                         "piece": p,
                         "layer": layer,
                         "shoes": base,
                         "top": None,
-                        "bottom": None
+                        "bottom": None,
                     },
-                    sc
-                )
+                ))
 
             for t in (topBase if len(topBase) <= 20 else rnd.sample(topBase, 20)):
                 for b in (bottom if len(bottom) <= 20 else rnd.sample(bottom, 20)):
@@ -3824,17 +4029,21 @@ async def quickpair(
                         base_item=base,
                     )
 
-                    _upd(
+                    scarpe_pool.append((
+                        sc,
                         {
                             "base": base,
                             "top": t,
                             "bottom": b,
                             "layer": layer,
                             "shoes": base,
-                            "piece": None
+                            "piece": None,
                         },
-                        sc
-                    )
+                    ))
+
+            scarpe_pool.sort(key=lambda x: x[0], reverse=True)
+            for sc, cand in scarpe_pool[:_TOP_N]:
+                _upd(cand, sc)
 
         elif base.get("categoria") == "topLayer":
             for t in (topBase if len(topBase) <= 20 else rnd.sample(topBase, 20)):
@@ -4059,6 +4268,27 @@ async def quickpair(
 
         payload.update(scelta)
         payload["descrizione"] = description
+
+        outfit_for_log = {
+            "pezzoUnico": best.get("piece"),
+            "top": best.get("top"),
+            "bottom": best.get("bottom"),
+            "layer": best.get("layer"),
+            "shoes": best.get("shoes"),
+        }
+        sid_qp = _log_outfit_suggestion_safe(
+            user_id=userId,
+            source="quickpair",
+            outfit_parts=outfit_for_log,
+            style=stile_l,
+            season=stagione_l,
+            is_premium=is_premium,
+            base_item_id=baseId,
+            base_category=base_cat,
+            score=selected_score,
+        )
+        if sid_qp:
+            payload["suggestionId"] = sid_qp
 
         return JSONResponse(content=payload)
 
