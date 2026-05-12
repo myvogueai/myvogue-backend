@@ -1146,10 +1146,17 @@ def _build_styling_reason(
                         f"Con {bn}{color_hint}, el navy mantiene el conjunto ordenado y el calzado claro lo aligera.",
                     )
                 if layer:
+                    layer_title = str(layer.get("nome") or "").strip()
+                    if layer_title:
+                        return T(
+                            f"Intorno a {bn}, {layer_title} aggiunge struttura al look senza appesantire i colori.",
+                            f"Around {bn}, {layer_title} adds structure without weighing down the outfit.",
+                            f"Con {bn}, {layer_title} da estructura al look sin cargar los colores.",
+                        )
                     return T(
-                        f"Intorno a {bn}, il secondo strato completa la silhouette senza appesantire i colori.",
-                        f"Around {bn}, the extra layer finishes the silhouette without weighing down the palette.",
-                        f"Con {bn}, la capa extra cierra la silueta sin cargar los colores.",
+                        f"Intorno a {bn}, il capo sopra aggiunge equilibrio al look senza renderlo pesante.",
+                        f"Around {bn}, the piece on top balances the outfit without feeling heavy.",
+                        f"Con {bn}, la prenda de arriba equilibra el look sin resultar pesado.",
                     )
                 return T(
                     f"Intorno a {bn}, tonalità e proporzioni restano bilanciate per un abbinamento credibile.",
@@ -1159,21 +1166,21 @@ def _build_styling_reason(
 
         if formal_layer:
             return T(
-                "Il capo spalla dà struttura al look, mentre pantaloni e scarpe mantengono il ritmo cromatico ordinato.",
-                "The shoulder piece structures the look, while pants and shoes keep the color rhythm clean.",
-                "La prenda de hombro estructura el look, mientras pantalón y zapatos mantienen el color ordenado.",
+                "La giacca dà struttura al look; pantaloni e scarpe tengono ordinati i colori.",
+                "The jacket structures the look, while pants and shoes keep the palette tidy.",
+                "La chaqueta estructura el look; pantalón y zapatos mantienen los colores ordenados.",
             )
 
         if navy_like:
             return T(
-                "Il navy resta protagonista della palette, con gli altri elementi che lo supportano senza rumore visivo.",
-                "Navy anchors the palette, with the other pieces supporting it without visual noise.",
-                "El navy centra la paleta y el resto apoya sin ruido visual.",
+                "Il navy tiene uniti i colori del look; gli altri capi completano senza creare confusione.",
+                "Navy ties the outfit colors together; the other pieces complete it without visual clutter.",
+                "El navy une los colores del look; el resto completa sin crear confusión.",
             )
 
         if neutral_count >= 2 and accent_count == 1:
             return T(
-                "La base neutra tiene pulito l'outfit e l'accento di colore scala il risultato senza stravolgerlo.",
+                "La base a toni neutri tiene pulito il look e il tocco di colore lo scala senza stravolgerlo.",
                 "A neutral base keeps the outfit clean, and the color accent lifts it without overpowering.",
                 "La base neutra mantiene limpio el conjunto y el toque de color lo eleva sin dominar.",
             )
@@ -1189,16 +1196,16 @@ def _build_styling_reason(
 
         if layer and piece:
             return T(
-                "Il pezzo unico resta al centro e il layer aggiunge profondità senza competere con la silhouette.",
-                "The one-piece stays central and the layer adds depth without fighting the silhouette.",
-                "La pieza única mantiene el foco y la capa añade profundidad sin competir con la silueta.",
+                "Il capo principale resta al centro e il capo sopra completa il look senza appesantirlo.",
+                "The main piece stays central and the layer on top completes without overpowering.",
+                "La prenda principal sigue al centro y la de arriba completa sin cargar el look.",
             )
 
         if layer and style_eff in {"casual", "streetwear", "sportivo"}:
             return T(
-                "Il layering aiuta a giocare con texture e volumi mantenendo coerenti scarpe e pantalone.",
-                "Layering plays with texture and volume while keeping shoes and trousers coherent.",
-                "El capas juega con textura y volumen manteniendo zapato y pantalón coherentes.",
+                "Il capo sopra permette di variare volume e tessuti mantenendo scarpe e pantalone coerenti.",
+                "A piece on top varies volume and texture while keeping shoes and trousers coherent.",
+                "La prenda superior permite variar volumen y textura manteniendo zapato y pantalón coherentes.",
             )
 
         shoe_nm = str((shoes or {}).get("nome") or "").lower()
