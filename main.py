@@ -2840,12 +2840,32 @@ async def iap_verify(request: Request, body: IapVerifyBody):
 
 # ------------------------------
 # 12) /upload — Upload immagine + background removal + Storage
+# (legacy endpoint; Flutter currently uploads directly to Firebase Storage)
 # ------------------------------
 
 @app.post("/upload")
-async def upload_image(file: UploadFile = File(...)):
+async def upload_image(
+    request: Request,
+    file: UploadFile = File(...),
+    userId_query: str | None = Query(None, alias="userId"),
+    userId_form: str | None = Form(None, alias="userId"),
+):
     try:
+        uid = require_firebase_uid(request)
+        print("[/upload] authenticated uid=", uid)
         print("=== ENTER /upload ===")
+
+        q = (userId_query or "").strip() or None
+        f = (userId_form or "").strip() or None
+        if q and f and q != f:
+            raise HTTPException(status_code=400, detail="Conflicting userId in query and form.")
+        claimed_user_id = q or f
+        if claimed_user_id and claimed_user_id != uid:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: userId does not match authenticated user.",
+            )
+
         print("filename:", file.filename if file else None)
 
         raw = await file.read()
@@ -2894,8 +2914,8 @@ async def upload_image(file: UploadFile = File(...)):
         out.seek(0)
         png_bytes = out.read()
 
-        uid = str(uuid.uuid4())
-        path = f"items/final_{uid}.png"
+        file_uid = str(uuid.uuid4())
+        path = f"items/{uid}/final_{file_uid}.png"
 
         blob = bucket.blob(path)
         token = str(uuid.uuid4())
