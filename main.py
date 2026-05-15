@@ -52,23 +52,51 @@ def normalize_stagione(s: str | None) -> str:
         return ""
     return str(s).strip().lower()
 
+
+def _firestore_json_scalar(v):
+    """Converte valori Firestore (datetime/Timestamp-like) in forma JSON-safe."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.isoformat()
+    sec = getattr(v, "seconds", None)
+    if isinstance(sec, int):
+        ns = getattr(v, "nanoseconds", 0)
+        try:
+            ns_i = int(ns) if ns is not None else 0
+            return datetime.fromtimestamp(sec + ns_i / 1e9, tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            pass
+    tn = getattr(v, "timestamp", None)
+    if callable(tn):
+        try:
+            ts = tn()
+            if isinstance(ts, (int, float)):
+                return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        except (TypeError, OSError, ValueError):
+            pass
+    return v
+
+
 def _slim(it: dict | None):
     """Rende l'oggetto capo JSON-serializzabile (niente Timestamp ecc.)."""
     if not it:
         return None
     return {
-        "id": it.get("docId") or it.get("id"),
-        "categoria": it.get("categoria"),
-        "nome": it.get("nome"),
-        "stile": it.get("stile"),
-        "colore": it.get("colore"),
-        "imageUrl": it.get("imageUrl"),
+        "id": _firestore_json_scalar(it.get("docId") or it.get("id")),
+        "categoria": _firestore_json_scalar(it.get("categoria")),
+        "nome": _firestore_json_scalar(it.get("nome")),
+        "stile": _firestore_json_scalar(it.get("stile")),
+        "colore": _firestore_json_scalar(it.get("colore")),
+        "imageUrl": _firestore_json_scalar(it.get("imageUrl")),
     }
 
 # ------------------------------
 # 4) ENV & FLAGS
 # ------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# Master switch: False disattiva le chiamate GPT negli endpoint (outfit AI-first, judge, helper testuali).
+USE_GPT = False
 
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 FIREBASE_BUCKET = os.getenv("FIREBASE_BUCKET", "")
@@ -462,22 +490,30 @@ def reserve_free_daily_or_raise(userId: str):
     """
     day = today_iso_rome()
     ref = db.collection("quota").document(userId)
-    snap = ref.get()
-    data = snap.to_dict() if snap.exists else {}
-    used = data.get(day, {}).get("freeDaily", 0)
-    if used >= 1:
-        detail = {
-            "code": "QUOTA",
-            "message": "Hai già ottenuto il suggerimento gratuito di oggi. Torna domani o passa a Premium.",
-            "feature": "freeDaily",
-            "limit": 1,
-            "used": used,
-            "remaining": 0,
-            "resetAtLocal": f"{day}T23:59:59+02:00",  # mezzanotte Europe/Rome
-        }
-        raise HTTPException(status_code=429, detail=detail)
-    data.setdefault(day, {})["freeDaily"] = used + 1
-    ref.set(data, merge=True)
+
+    @firestore.transactional
+    def _reserve_txn(transaction, doc_ref, day_key: str):
+        snap = doc_ref.get(transaction=transaction)
+        data = dict(snap.to_dict()) if snap.exists else {}
+        used = data.get(day_key, {}).get("freeDaily", 0)
+        if used >= 1:
+            detail = {
+                "code": "QUOTA",
+                "message": "Hai già ottenuto il suggerimento gratuito di oggi. Torna domani o passa a Premium.",
+                "feature": "freeDaily",
+                "limit": 1,
+                "used": used,
+                "remaining": 0,
+                "resetAtLocal": f"{day_key}T23:59:59+02:00",  # mezzanotte Europe/Rome
+            }
+            raise HTTPException(status_code=429, detail=detail)
+        day_bucket = dict(data.get(day_key) or {})
+        day_bucket["freeDaily"] = used + 1
+        data[day_key] = day_bucket
+        transaction.set(doc_ref, data, merge=True)
+
+    txn = db.transaction()
+    _reserve_txn(txn, ref, day)
 
 def rollback_free_daily_if_any(userId: str):
     """Opzionale: in caso di errore dopo la prenotazione, rimette la quota."""
@@ -2526,6 +2562,8 @@ def _ai_choose_outfits(articoli: list[dict], stile: str, stagione: str, lang: st
       "consiglioExtra": "..." }
     Oppure None se fallisce.
     """
+    if not USE_GPT:
+        return None
     if not openai or not OPENAI_API_KEY:
         return None
 
@@ -2575,6 +2613,8 @@ def _ai_pick_best_candidate(candidates: list[dict], stile: str, stagione: str, l
     Non esplora tutto l'armadio: valuta solo poche opzioni già sensate.
     Ritorna direttamente il dict 'outfit' del candidato vincente, oppure None.
     """
+    if not USE_GPT:
+        return None
     if not openai or not OPENAI_API_KEY:
         return None
 
@@ -3254,10 +3294,9 @@ async def genera_outfit(
 
             # === AI-FIRST (Premium) — con timeout soft e n=maxOutfits ===
             idx = _index_by_id(articoli)
-            # Disattivo la scelta outfit via GPT:
-            # gli outfit vengono scelti solo dalla logica locale,
-            # molto più stabile per il cuore del Lookbook.
-            ai_result = None
+            ai_result = _ai_choose_outfits(
+                articoli, stile_l_req, stagione_l, lang, lang_name, n=maxOutfits
+            )
 
             if ai_result and ai_result.get("outfits"):
                 outfits_payload = []
@@ -3488,7 +3527,7 @@ async def genera_outfit(
                     pass
 
             # GPT come giudice finale: sceglie solo tra i migliori candidati locali (max 5).
-            if not noAI:
+            if USE_GPT and not noAI:
                 print("GPT judge enabled")
                 picked_outfit = _ai_pick_best_candidate(
                     topK[:5], stile_l_req, stagione_l, lang_name
@@ -3551,11 +3590,6 @@ async def genera_outfit(
 
                 description = fallback_description(descr, lang)
                 consiglio_extra = ""
-
-                if idx == 0:
-                    # GPT disattivato temporaneamente per stabilizzare /outfit su Render.
-                    # Usiamo solo descrizione locale e nessun consiglio extra.
-                    pass
 
                 scelta["descrizione"] = description
                 scelta["consiglioExtra"] = consiglio_extra
@@ -3973,6 +4007,8 @@ def safe_gpt_text(prompt: str, max_tokens: int = 120, temperature: float = 0.8, 
     Genera un testo con GPT senza bloccare l'endpoint.
     Usa il timeout nativo della libreria OpenAI, più stabile di signal.alarm in Colab/Uvicorn.
     """
+    if not USE_GPT:
+        return None
     if not openai or not OPENAI_API_KEY:
         return None
 
