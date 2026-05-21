@@ -2219,6 +2219,18 @@ def _color_raw_for_score_v1(item) -> str | None:
     return str(c).strip()
 
 
+# =============================================================================
+# DEPRECATED / DO NOT USE IN PRODUCTION
+#
+# outfit_score_v2 is an experimental scoring engine with a different scale [-1, +1].
+# The production engine is outfit_score(...), which is cumulative and not clamped.
+# Do not replace outfit_score calls with outfit_score_v2 without a full migration plan
+# and golden regression tests.
+#
+# Keep this function only as historical/reference code until the scoring engine is
+# either fully migrated or the function is safely removed after regression coverage.
+# =============================================================================
+
 def outfit_score_v2(
     top=None,
     bottom=None,
