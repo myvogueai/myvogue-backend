@@ -1647,6 +1647,26 @@ def color_relation_score(c1, c2) -> float:
     if t1 == t2:
         return 0.65
 
+    _PREMIUM = {
+        frozenset({"nero", "bianco"}): 0.90,
+        frozenset({"navy", "bianco"}): 0.88,
+        frozenset({"beige", "avorio"}): 0.87,
+        frozenset({"beige", "bianco"}): 0.87,
+        frozenset({"blu", "bianco"}): 0.86,
+        frozenset({"navy", "avorio"}): 0.86,
+        frozenset({"beige", "navy"}): 0.86,
+        frozenset({"marrone", "beige"}): 0.86,
+        frozenset({"beige", "nero"}): 0.85,
+        frozenset({"navy", "beige"}): 0.84,
+        frozenset({"nero", "bordeaux"}): 0.84,
+        frozenset({"grigio", "bordeaux"}): 0.82,
+        frozenset({"grigio", "blu"}): 0.82,
+        frozenset({"oliva", "beige"}): 0.80,
+    }
+    pair = frozenset({t1, t2})
+    if pair in _PREMIUM:
+        return _PREMIUM[pair]
+
     # Coppie neutre classiche: abbinamenti iconici moda, non mediocri
     _CLASSIC = {
         frozenset({"bianco", "nero"}):   0.85,
