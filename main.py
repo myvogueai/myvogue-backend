@@ -143,6 +143,7 @@ if vision is not None:
 # Il flusso GET /outfit FREE reale usa reserve_free_daily_or_raise (1 look/giorno, chiave freeDaily), non questo numero.
 FREE_OUTFIT_LIMIT = int(os.getenv("FREE_OUTFIT_LIMIT", "8"))
 QUICKPAIR_FREE_DAILY_LIMIT = int(os.getenv("QUICKPAIR_FREE_DAILY_LIMIT", "2"))  # free: max 2 QuickPair/giorno (feature "quickpair")
+OUTFIT_SCAN_PREMIUM_DAILY_LIMIT = int(os.getenv("OUTFIT_SCAN_DAILY_LIMIT", "5"))
 
 
 def check_and_increment_quota_or_raise(userId: str, feature: str, limit_free: int | None = None):
@@ -526,6 +527,48 @@ def rollback_free_daily_if_any(userId: str):
     if data.get(day, {}).get("freeDaily", 0) > 0:
         data[day]["freeDaily"] = max(0, data[day]["freeDaily"] - 1)
         ref.set(data, merge=True)
+
+
+def reserve_outfit_scan_daily_or_raise(userId: str) -> dict:
+    """
+    Prenota uno slot Outfit Scan Premium per il giorno (Europe/Rome).
+    Max OUTFIT_SCAN_PREMIUM_DAILY_LIMIT/giorno su quota/{userId}.outfitScan.
+    """
+    day = today_iso_rome()
+    ref = db.collection("quota").document(userId)
+    limit = OUTFIT_SCAN_PREMIUM_DAILY_LIMIT
+
+    @firestore.transactional
+    def _reserve_txn(transaction, doc_ref, day_key: str):
+        snap = doc_ref.get(transaction=transaction)
+        data = dict(snap.to_dict()) if snap.exists else {}
+        used = int((data.get(day_key) or {}).get("outfitScan", 0) or 0)
+        if used >= limit:
+            detail = {
+                "code": "QUOTA",
+                "message": "Hai raggiunto il limite giornaliero di Outfit Scan. Riprova domani.",
+                "feature": "outfitScan",
+                "limit": limit,
+                "used": used,
+                "remaining": 0,
+                "resetAtLocal": f"{day_key}T23:59:59+02:00",
+            }
+            raise HTTPException(status_code=429, detail=detail)
+        new_used = used + 1
+        day_bucket = dict(data.get(day_key) or {})
+        day_bucket["outfitScan"] = new_used
+        data[day_key] = day_bucket
+        transaction.set(doc_ref, data, merge=True)
+        return {
+            "feature": "outfitScan",
+            "limit": limit,
+            "used": new_used,
+            "remaining": max(0, limit - new_used),
+            "resetAtLocal": f"{day_key}T23:59:59+02:00",
+        }
+
+    txn = db.transaction()
+    return _reserve_txn(txn, ref, day)
 
 
 # ------------------------------
@@ -4687,6 +4730,93 @@ async def quickpair(
         raise
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
+# ------------------------------
+# 13-ter) /outfit-scan — Outfit Scan MVP (mock, senza AI/Storage)
+# ------------------------------
+class OutfitScanBody(BaseModel):
+    userId: str = Field(..., min_length=1)
+    imagePath: str = Field(..., min_length=1)
+    scanSessionId: str | None = None
+    lang: str | None = None
+    provider: str | None = None
+
+
+@app.post("/outfit-scan")
+async def outfit_scan(request: Request, body: OutfitScanBody):
+    uid = require_uid_match(request, body.userId)
+
+    if not get_effective_premium_from_firestore(uid):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "PREMIUM_REQUIRED",
+                "message": "Outfit Scan è disponibile solo per utenti Premium.",
+            },
+        )
+
+    image_path = (body.imagePath or "").strip().lstrip("/")
+    expected_prefix = f"scans/{uid}/"
+    if not image_path.startswith(expected_prefix):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_IMAGE_PATH",
+                "message": f"imagePath deve iniziare con {expected_prefix}",
+            },
+        )
+
+    quota = reserve_outfit_scan_daily_or_raise(uid)
+
+    scan_session_id = (body.scanSessionId or "").strip() or str(uuid.uuid4())
+
+    mock_items = [
+        {
+            "tempId": "mock-1",
+            "nome": "Maglietta bianca",
+            "categoria": "topBase",
+            "colore": "bianco",
+            "stile": "casual",
+            "stagione": "estate",
+            "reviewStatus": "pending",
+            "scanConfidence": 0.91,
+            "scanRawLabel": "white t-shirt",
+        },
+        {
+            "tempId": "mock-2",
+            "nome": "Jeans blu",
+            "categoria": "bottom",
+            "colore": "blu",
+            "stile": "casual",
+            "stagione": "estate",
+            "reviewStatus": "pending",
+            "scanConfidence": 0.88,
+            "scanRawLabel": "blue jeans",
+        },
+        {
+            "tempId": "mock-3",
+            "nome": "Sneakers nere",
+            "categoria": "scarpe",
+            "colore": "nero",
+            "stile": "casual",
+            "stagione": "estate",
+            "reviewStatus": "pending",
+            "scanConfidence": 0.85,
+            "scanRawLabel": "black sneakers",
+        },
+    ]
+
+    return JSONResponse(
+        content={
+            "success": True,
+            "scanSessionId": scan_session_id,
+            "status": "mock",
+            "provider": "mock",
+            "quota": quota,
+            "outfitImagePath": image_path,
+            "items": mock_items,
+        }
+    )
 
 # ------------------------------
 # 14) SOLO ARMADI PUBBLICI — /public_users e /public_wardrobe
