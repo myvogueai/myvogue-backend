@@ -2,6 +2,7 @@ import json
 import os, uuid, random, time, signal, base64, io, re, asyncio
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 
@@ -4745,6 +4746,8 @@ async def quickpair(
 _OUTFIT_SCAN_VALID_CATEGORIE = frozenset({"topBase", "topLayer", "bottom", "scarpe", "pezzoUnico"})
 _OUTFIT_SCAN_VALID_STILI = frozenset({"casual", "elegante", "streetwear", "sportivo"})
 _OUTFIT_SCAN_VALID_STAGIONI = frozenset({"primavera", "estate", "autunno", "inverno"})
+_OUTFIT_SCAN_VISION_MAX_EDGE = 1280
+_OUTFIT_SCAN_VISION_MIN_CONFIDENCE = 0.4
 
 
 def _outfit_scan_mock_items() -> list[dict]:
@@ -4788,12 +4791,16 @@ def _outfit_scan_mock_items() -> list[dict]:
 def _outfit_scan_vision_prompt(lang: str) -> str:
     lang_name = "italiano" if lang.startswith("it") else "English"
     return (
-        "Analizza la foto outfit. Devi riconoscere solo capi realmente visibili. "
-        "Non inventare capi. Se un capo è coperto o incerto, abbassa scanConfidence. "
-        "Restituisci massimo 6 capi. Ignora volto, corpo, ambiente, accessori piccoli, sfondo e specchio. "
-        "Output solo JSON valido.\n\n"
+        "Analizza la foto outfit. Devi riconoscere solo capi realmente visibili.\n"
+        "Rispondi SOLO con JSON valido, senza markdown, senza testo aggiuntivo.\n"
+        "Preferisci il formato: {\"items\": [...]} (max 6 elementi).\n"
+        "Un array JSON semplice è accettabile.\n\n"
         f"Scrivi i nomi dei capi in {lang_name}.\n\n"
-        "Restituisci SOLO un JSON array (max 6 elementi). Ogni elemento:\n"
+        "NON includere: borse, cinture, occhiali, cappelli, gioielli, orologi, calze, collant, "
+        "accessori piccoli, volto, corpo, ambiente, sfondo, specchio.\n"
+        "NON inventare capi non chiaramente visibili.\n"
+        "NON includere capi coperti al 70% o più.\n\n"
+        "Ogni elemento in items:\n"
         "{\n"
         '  "nome": "...",\n'
         '  "categoria": "topBase | topLayer | bottom | scarpe | pezzoUnico",\n'
@@ -4803,6 +4810,11 @@ def _outfit_scan_vision_prompt(lang: str) -> str:
         '  "scanConfidence": 0.0,\n'
         '  "scanRawLabel": "..."\n'
         "}\n\n"
+        "scanConfidence:\n"
+        "- 0.9 se capo chiaramente visibile e identificabile\n"
+        "- 0.7 se visibile ma parzialmente coperto\n"
+        "- 0.5 se incerto\n"
+        "- non includere capi sotto 0.4\n\n"
         "Regole categoriche:\n"
         "- blazer, giacca, cappotto, cardigan, giubbotto = topLayer\n"
         "- camicia, t-shirt, maglia, polo, top = topBase\n"
@@ -4817,16 +4829,38 @@ def _download_storage_image_b64(image_path: str) -> tuple[str, str]:
     if not blob.exists():
         raise FileNotFoundError(f"image not found: {image_path}")
     data = blob.download_as_bytes()
-    mime = (blob.content_type or "").strip().lower()
-    if not mime or mime == "application/octet-stream":
-        lower = image_path.lower()
-        if lower.endswith(".png"):
-            mime = "image/png"
-        elif lower.endswith(".webp"):
-            mime = "image/webp"
-        else:
-            mime = "image/jpeg"
-    return base64.b64encode(data).decode("ascii"), mime
+    img = Image.open(BytesIO(data))
+    img = ImageOps.exif_transpose(img)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    elif img.mode == "L":
+        img = img.convert("RGB")
+    w, h = img.size
+    max_edge = max(w, h)
+    if max_edge > _OUTFIT_SCAN_VISION_MAX_EDGE:
+        scale = _OUTFIT_SCAN_VISION_MAX_EDGE / max_edge
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=85, optimize=True)
+    out.seek(0)
+    return base64.b64encode(out.read()).decode("ascii"), "image/jpeg"
+
+
+def _vision_call_with_timeout(fn, *args, timeout_sec: float, **kwargs):
+    """Hard timeout lato codice: backup a request_timeout/urllib che possono non essere affidabili."""
+    ex = ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(fn, *args, timeout_sec=timeout_sec, **kwargs)
+    try:
+        result = fut.result(timeout=timeout_sec)
+    except FuturesTimeoutError as e:
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise TimeoutError(f"vision exceeded {timeout_sec}s") from e
+    except Exception:
+        ex.shutdown(wait=True)
+        raise
+    else:
+        ex.shutdown(wait=True)
+        return result
 
 
 def _extract_json_from_vision_text(text: str):
@@ -4881,6 +4915,8 @@ def _normalize_outfit_scan_item(raw: dict, idx: int) -> dict | None:
     except (TypeError, ValueError):
         conf = 0.5
     conf = max(0.0, min(1.0, conf))
+    if conf < _OUTFIT_SCAN_VISION_MIN_CONFIDENCE:
+        return None
     return {
         "tempId": str(raw.get("tempId") or f"scan-{uuid.uuid4().hex[:8]}-{idx}"),
         "nome": nome,
@@ -4914,11 +4950,12 @@ def _parse_vision_items_response(raw_text: str) -> list[dict]:
     return items
 
 
-def _call_openai_outfit_vision(b64: str, mime: str, lang: str) -> str:
+def _call_openai_outfit_vision(b64: str, mime: str, lang: str, timeout_sec: float | None = None) -> str:
     if not openai:
         raise RuntimeError("openai package not available")
     if not VISION_API_KEY:
         raise RuntimeError("VISION_API_KEY missing")
+    req_timeout = timeout_sec if timeout_sec is not None else OUTFIT_SCAN_VISION_TIMEOUT_SEC
     resp = openai.ChatCompletion.create(
         model="gpt-4o-mini",
         api_key=VISION_API_KEY,
@@ -4931,14 +4968,15 @@ def _call_openai_outfit_vision(b64: str, mime: str, lang: str) -> str:
         }],
         max_tokens=1800,
         temperature=0.2,
-        request_timeout=OUTFIT_SCAN_VISION_TIMEOUT_SEC,
+        request_timeout=req_timeout,
     )
     return (resp.choices[0].message.content or "").strip()
 
 
-def _call_gemini_outfit_vision(b64: str, mime: str, lang: str) -> str:
+def _call_gemini_outfit_vision(b64: str, mime: str, lang: str, timeout_sec: float | None = None) -> str:
     if not VISION_API_KEY:
         raise RuntimeError("VISION_API_KEY missing")
+    req_timeout = timeout_sec if timeout_sec is not None else OUTFIT_SCAN_VISION_TIMEOUT_SEC
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"gemini-1.5-flash:generateContent?key={VISION_API_KEY}"
@@ -4963,7 +5001,7 @@ def _call_gemini_outfit_vision(b64: str, mime: str, lang: str) -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=OUTFIT_SCAN_VISION_TIMEOUT_SEC) as resp:
+        with urllib.request.urlopen(req, timeout=req_timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
@@ -4997,17 +5035,30 @@ def _run_outfit_scan_vision(image_path: str, lang: str) -> tuple[list[dict], str
         return [], "vision_error", provider
 
     caller = _call_openai_outfit_vision if provider == "openai" else _call_gemini_outfit_vision
+    deadline = time.monotonic() + OUTFIT_SCAN_VISION_TIMEOUT_SEC
     for attempt in range(2):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.5:
+            print(f"[outfit-scan] vision budget exhausted before attempt {attempt + 1}")
+            break
+        per_attempt_timeout = max(1.0, remaining - 0.2)
         try:
-            raw_text = caller(b64, mime, lang)
+            raw_text = _vision_call_with_timeout(
+                caller, b64, mime, lang, timeout_sec=per_attempt_timeout
+            )
             items = _parse_vision_items_response(raw_text)
             if items:
                 return items, "ok", provider
             print(f"[outfit-scan] vision attempt {attempt + 1}: parsed 0 items")
+        except TimeoutError as e:
+            print(f"[outfit-scan] vision attempt {attempt + 1} timeout: {e}")
+            break
         except Exception as e:
             print(f"[outfit-scan] vision attempt {attempt + 1} failed: {type(e).__name__}: {e}")
         if attempt == 0:
-            time.sleep(0.4)
+            sleep_budget = deadline - time.monotonic() - 0.5
+            if sleep_budget > 0:
+                time.sleep(min(0.4, sleep_budget))
 
     return [], "vision_error", provider
 
