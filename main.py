@@ -1,5 +1,7 @@
 import json
-import os, uuid, random, time, signal, base64, io
+import os, uuid, random, time, signal, base64, io, re, asyncio
+import urllib.request
+import urllib.error
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 
@@ -108,6 +110,12 @@ COMMUNITY_PUBLIC_ONLY = os.getenv("COMMUNITY_PUBLIC_ONLY", "true").lower() == "t
 GOOGLE_PLAY_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON", "").strip()
 ANDROID_PACKAGE_NAME = os.getenv("ANDROID_PACKAGE_NAME", "com.myvogueai.app").strip()
 IAP_PRODUCT_IDS = frozenset({"premium_monthly", "premium_yearly"})
+
+# Outfit Scan AI Vision (Step 4)
+VISION_PROVIDER = os.getenv("VISION_PROVIDER", "openai").strip().lower()
+VISION_API_KEY = os.getenv("VISION_API_KEY", "").strip()
+OUTFIT_SCAN_USE_VISION = os.getenv("OUTFIT_SCAN_USE_VISION", "false").lower() == "true"
+OUTFIT_SCAN_VISION_TIMEOUT_SEC = int(os.getenv("OUTFIT_SCAN_VISION_TIMEOUT_SEC", "25"))
 
 # ------------------------------
 # 5) INIT OpenAI
@@ -4732,45 +4740,15 @@ async def quickpair(
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 # ------------------------------
-# 13-ter) /outfit-scan — Outfit Scan MVP (mock, senza AI/Storage)
+# 13-ter) /outfit-scan — Outfit Scan (mock o AI Vision)
 # ------------------------------
-class OutfitScanBody(BaseModel):
-    userId: str = Field(..., min_length=1)
-    imagePath: str = Field(..., min_length=1)
-    scanSessionId: str | None = None
-    lang: str | None = None
-    provider: str | None = None
+_OUTFIT_SCAN_VALID_CATEGORIE = frozenset({"topBase", "topLayer", "bottom", "scarpe", "pezzoUnico"})
+_OUTFIT_SCAN_VALID_STILI = frozenset({"casual", "elegante", "streetwear", "sportivo"})
+_OUTFIT_SCAN_VALID_STAGIONI = frozenset({"primavera", "estate", "autunno", "inverno"})
 
 
-@app.post("/outfit-scan")
-async def outfit_scan(request: Request, body: OutfitScanBody):
-    uid = require_uid_match(request, body.userId)
-
-    if not get_effective_premium_from_firestore(uid):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PREMIUM_REQUIRED",
-                "message": "Outfit Scan è disponibile solo per utenti Premium.",
-            },
-        )
-
-    image_path = (body.imagePath or "").strip().lstrip("/")
-    expected_prefix = f"scans/{uid}/"
-    if not image_path.startswith(expected_prefix):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "INVALID_IMAGE_PATH",
-                "message": f"imagePath deve iniziare con {expected_prefix}",
-            },
-        )
-
-    quota = reserve_outfit_scan_daily_or_raise(uid)
-
-    scan_session_id = (body.scanSessionId or "").strip() or str(uuid.uuid4())
-
-    mock_items = [
+def _outfit_scan_mock_items() -> list[dict]:
+    return [
         {
             "tempId": "mock-1",
             "nome": "Maglietta bianca",
@@ -4806,15 +4784,289 @@ async def outfit_scan(request: Request, body: OutfitScanBody):
         },
     ]
 
+
+def _outfit_scan_vision_prompt(lang: str) -> str:
+    lang_name = "italiano" if lang.startswith("it") else "English"
+    return (
+        "Analizza la foto outfit. Devi riconoscere solo capi realmente visibili. "
+        "Non inventare capi. Se un capo è coperto o incerto, abbassa scanConfidence. "
+        "Restituisci massimo 6 capi. Ignora volto, corpo, ambiente, accessori piccoli, sfondo e specchio. "
+        "Output solo JSON valido.\n\n"
+        f"Scrivi i nomi dei capi in {lang_name}.\n\n"
+        "Restituisci SOLO un JSON array (max 6 elementi). Ogni elemento:\n"
+        "{\n"
+        '  "nome": "...",\n'
+        '  "categoria": "topBase | topLayer | bottom | scarpe | pezzoUnico",\n'
+        '  "colore": "...",\n'
+        '  "stile": "casual | elegante | streetwear | sportivo",\n'
+        '  "stagione": "primavera | estate | autunno | inverno",\n'
+        '  "scanConfidence": 0.0,\n'
+        '  "scanRawLabel": "..."\n'
+        "}\n\n"
+        "Regole categoriche:\n"
+        "- blazer, giacca, cappotto, cardigan, giubbotto = topLayer\n"
+        "- camicia, t-shirt, maglia, polo, top = topBase\n"
+        "- pantaloni, jeans, shorts, gonna = bottom\n"
+        "- scarpe, sneakers, stivali, mocassini = scarpe\n"
+        "- vestito/tuta intera = pezzoUnico"
+    )
+
+
+def _download_storage_image_b64(image_path: str) -> tuple[str, str]:
+    blob = bucket.blob(image_path)
+    if not blob.exists():
+        raise FileNotFoundError(f"image not found: {image_path}")
+    data = blob.download_as_bytes()
+    mime = (blob.content_type or "").strip().lower()
+    if not mime or mime == "application/octet-stream":
+        lower = image_path.lower()
+        if lower.endswith(".png"):
+            mime = "image/png"
+        elif lower.endswith(".webp"):
+            mime = "image/webp"
+        else:
+            mime = "image/jpeg"
+    return base64.b64encode(data).decode("ascii"), mime
+
+
+def _extract_json_from_vision_text(text: str):
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("empty vision response")
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        raw = fenced.group(1).strip()
+    return json.loads(raw)
+
+
+def _normalize_outfit_scan_categoria(categoria: str, nome: str, scan_raw) -> str:
+    cat = (categoria or "").strip()
+    if cat in _OUTFIT_SCAN_VALID_CATEGORIE:
+        return cat
+    text = f"{nome} {scan_raw or ''} {cat}".lower()
+    rules = (
+        ("pezzoUnico", ("vestito", "tuta intera", "dress", "jumpsuit", "romper")),
+        ("scarpe", ("scarpe", "sneakers", "stivali", "mocassini", "shoes", "boots", "loafers")),
+        ("topLayer", ("blazer", "giacca", "cappotto", "cardigan", "giubbotto", "jacket", "coat")),
+        ("bottom", ("pantaloni", "jeans", "shorts", "gonna", "pants", "trousers", "skirt")),
+        ("topBase", ("camicia", "t-shirt", "tshirt", "maglia", "polo", " shirt", "tee", "blouse", "top")),
+    )
+    for cat_name, keywords in rules:
+        if any(k in text for k in keywords):
+            return cat_name
+    return "topBase"
+
+
+def _normalize_outfit_scan_item(raw: dict, idx: int) -> dict | None:
+    nome = str(raw.get("nome") or "").strip()
+    if not nome:
+        return None
+    scan_raw = str(raw.get("scanRawLabel") or nome).strip()
+    categoria = _normalize_outfit_scan_categoria(
+        str(raw.get("categoria") or "").strip(),
+        nome,
+        scan_raw,
+    )
+    colore = normalize_color(raw.get("colore"))
+    if colore == "sconosciuto":
+        colore = str(raw.get("colore") or "").strip().lower() or "sconosciuto"
+    stile = normalize_stile(raw.get("stile"))
+    if stile not in _OUTFIT_SCAN_VALID_STILI:
+        stile = "casual"
+    stagione = normalize_stagione(raw.get("stagione"))
+    if stagione not in _OUTFIT_SCAN_VALID_STAGIONI:
+        stagione = "primavera"
+    try:
+        conf = float(raw.get("scanConfidence", 0.5))
+    except (TypeError, ValueError):
+        conf = 0.5
+    conf = max(0.0, min(1.0, conf))
+    return {
+        "tempId": str(raw.get("tempId") or f"scan-{uuid.uuid4().hex[:8]}-{idx}"),
+        "nome": nome,
+        "categoria": categoria,
+        "colore": colore,
+        "stile": stile,
+        "stagione": stagione,
+        "reviewStatus": "pending",
+        "scanConfidence": conf,
+        "scanRawLabel": scan_raw,
+    }
+
+
+def _parse_vision_items_response(raw_text: str) -> list[dict]:
+    data = _extract_json_from_vision_text(raw_text)
+    if isinstance(data, list):
+        raw_items = data
+    elif isinstance(data, dict):
+        raw_items = data.get("items") or data.get("capi") or []
+        if not isinstance(raw_items, list):
+            raw_items = [data] if data.get("nome") else []
+    else:
+        return []
+    items = []
+    for i, raw in enumerate(raw_items[:6]):
+        if not isinstance(raw, dict):
+            continue
+        item = _normalize_outfit_scan_item(raw, i)
+        if item:
+            items.append(item)
+    return items
+
+
+def _call_openai_outfit_vision(b64: str, mime: str, lang: str) -> str:
+    if not openai:
+        raise RuntimeError("openai package not available")
+    if not VISION_API_KEY:
+        raise RuntimeError("VISION_API_KEY missing")
+    resp = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        api_key=VISION_API_KEY,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _outfit_scan_vision_prompt(lang)},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            ],
+        }],
+        max_tokens=1800,
+        temperature=0.2,
+        request_timeout=OUTFIT_SCAN_VISION_TIMEOUT_SEC,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _call_gemini_outfit_vision(b64: str, mime: str, lang: str) -> str:
+    if not VISION_API_KEY:
+        raise RuntimeError("VISION_API_KEY missing")
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-1.5-flash:generateContent?key={VISION_API_KEY}"
+    )
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": _outfit_scan_vision_prompt(lang)},
+                {"inline_data": {"mime_type": mime, "data": b64}},
+            ],
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 2048,
+            "responseMimeType": "application/json",
+        },
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OUTFIT_SCAN_VISION_TIMEOUT_SEC) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"gemini HTTP {e.code}: {err_body[:300]}") from e
+    candidates = body.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("gemini empty candidates")
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    if not parts:
+        raise RuntimeError("gemini empty parts")
+    return str(parts[0].get("text") or "").strip()
+
+
+def _run_outfit_scan_vision(image_path: str, lang: str) -> tuple[list[dict], str, str]:
+    """
+    Scarica l'immagine da Storage, chiama il provider Vision, normalizza items.
+    Ritorna (items, status, provider) con status 'ok' o 'vision_error'.
+    """
+    provider = VISION_PROVIDER
+    if provider not in ("openai", "gemini"):
+        print(f"[outfit-scan] unsupported VISION_PROVIDER={provider}")
+        return [], "vision_error", provider
+    if not VISION_API_KEY:
+        print("[outfit-scan] VISION_API_KEY missing")
+        return [], "vision_error", provider
+
+    try:
+        b64, mime = _download_storage_image_b64(image_path)
+    except Exception as e:
+        print(f"[outfit-scan] storage download failed: {type(e).__name__}: {e}")
+        return [], "vision_error", provider
+
+    caller = _call_openai_outfit_vision if provider == "openai" else _call_gemini_outfit_vision
+    for attempt in range(2):
+        try:
+            raw_text = caller(b64, mime, lang)
+            items = _parse_vision_items_response(raw_text)
+            if items:
+                return items, "ok", provider
+            print(f"[outfit-scan] vision attempt {attempt + 1}: parsed 0 items")
+        except Exception as e:
+            print(f"[outfit-scan] vision attempt {attempt + 1} failed: {type(e).__name__}: {e}")
+        if attempt == 0:
+            time.sleep(0.4)
+
+    return [], "vision_error", provider
+
+
+class OutfitScanBody(BaseModel):
+    userId: str = Field(..., min_length=1)
+    imagePath: str = Field(..., min_length=1)
+    scanSessionId: str | None = None
+    lang: str | None = None
+    provider: str | None = None
+
+
+@app.post("/outfit-scan")
+async def outfit_scan(request: Request, body: OutfitScanBody):
+    uid = require_uid_match(request, body.userId)
+
+    if not get_effective_premium_from_firestore(uid):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "PREMIUM_REQUIRED",
+                "message": "Outfit Scan è disponibile solo per utenti Premium.",
+            },
+        )
+
+    image_path = (body.imagePath or "").strip().lstrip("/")
+    expected_prefix = f"scans/{uid}/"
+    if not image_path.startswith(expected_prefix):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_IMAGE_PATH",
+                "message": f"imagePath deve iniziare con {expected_prefix}",
+            },
+        )
+
+    quota = reserve_outfit_scan_daily_or_raise(uid)
+
+    scan_session_id = (body.scanSessionId or "").strip() or str(uuid.uuid4())
+    lang = (body.lang or get_user_lang(uid) or "it").lower()
+
+    if OUTFIT_SCAN_USE_VISION:
+        items, status, provider = await asyncio.to_thread(
+            _run_outfit_scan_vision, image_path, lang
+        )
+    else:
+        items = _outfit_scan_mock_items()
+        status = "mock"
+        provider = "mock"
+
     return JSONResponse(
         content={
             "success": True,
             "scanSessionId": scan_session_id,
-            "status": "mock",
-            "provider": "mock",
+            "status": status,
+            "provider": provider,
             "quota": quota,
             "outfitImagePath": image_path,
-            "items": mock_items,
+            "items": items,
         }
     )
 
