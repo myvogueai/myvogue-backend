@@ -4748,6 +4748,13 @@ _OUTFIT_SCAN_VALID_STILI = frozenset({"casual", "elegante", "streetwear", "sport
 _OUTFIT_SCAN_VALID_STAGIONI = frozenset({"primavera", "estate", "autunno", "inverno"})
 _OUTFIT_SCAN_VISION_MAX_EDGE = 1280
 _OUTFIT_SCAN_VISION_MIN_CONFIDENCE = 0.4
+_OUTFIT_SCAN_CROP_MIN_CONFIDENCE = 0.6
+_OUTFIT_SCAN_CROP_MIN_BOX_DIM = 0.04
+_OUTFIT_SCAN_CROP_MIN_BOX_AREA = 0.008
+_OUTFIT_SCAN_CROP_PADDING_RATIO = 0.10
+_OUTFIT_SCAN_CROP_MIN_PIXELS = 50
+_OUTFIT_SCAN_CROP_TIME_RESERVE_SEC = 8.0
+_OUTFIT_SCAN_MAX_CROP_ITEMS = 6
 
 
 def _outfit_scan_mock_items() -> list[dict]:
@@ -4808,13 +4815,24 @@ def _outfit_scan_vision_prompt(lang: str) -> str:
         '  "stile": "casual | elegante | streetwear | sportivo",\n'
         '  "stagione": "primavera | estate | autunno | inverno",\n'
         '  "scanConfidence": 0.0,\n'
-        '  "scanRawLabel": "..."\n'
+        '  "scanRawLabel": "...",\n'
+        '  "cropBox": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},\n'
+        '  "cropConfidence": 0.0\n'
         "}\n\n"
         "scanConfidence:\n"
         "- 0.9 se capo chiaramente visibile e identificabile\n"
         "- 0.7 se visibile ma parzialmente coperto\n"
         "- 0.5 se incerto\n"
         "- non includere capi sotto 0.4\n\n"
+        "cropBox e cropConfidence:\n"
+        "- Le coordinate cropBox sono normalizzate 0.0-1.0 sull'immagine analizzata "
+        "(dopo orientamento EXIF e ridimensionamento lato server, non l'originale full-res).\n"
+        "- x,y = angolo superiore sinistro; width,height = dimensioni del rettangolo.\n"
+        "- Includi cropBox solo se il capo è sufficientemente visibile e il box è affidabile.\n"
+        "- NON inventare box. Se il box è incerto, ometti cropBox e cropConfidence.\n"
+        "- cropConfidence 0.0-1.0: confidenza sul bounding box.\n"
+        "- Non includere cropBox con cropConfidence sotto 0.6.\n"
+        "- Il box deve contenere principalmente il capo, non volto/sfondo/specchio.\n\n"
         "Regole categoriche:\n"
         "- blazer, giacca, cappotto, cardigan, giubbotto = topLayer\n"
         "- camicia, t-shirt, maglia, polo, top = topBase\n"
@@ -4824,7 +4842,8 @@ def _outfit_scan_vision_prompt(lang: str) -> str:
     )
 
 
-def _download_storage_image_b64(image_path: str) -> tuple[str, str]:
+def _load_outfit_scan_image(image_path: str) -> tuple[Image.Image, str, str]:
+    """Scarica da Storage, EXIF fix, resize max edge; ritorna PIL RGB, base64 JPEG, mime."""
     blob = bucket.blob(image_path)
     if not blob.exists():
         raise FileNotFoundError(f"image not found: {image_path}")
@@ -4843,7 +4862,12 @@ def _download_storage_image_b64(image_path: str) -> tuple[str, str]:
     out = BytesIO()
     img.save(out, format="JPEG", quality=85, optimize=True)
     out.seek(0)
-    return base64.b64encode(out.read()).decode("ascii"), "image/jpeg"
+    return img, base64.b64encode(out.read()).decode("ascii"), "image/jpeg"
+
+
+def _download_storage_image_b64(image_path: str) -> tuple[str, str]:
+    _, b64, mime = _load_outfit_scan_image(image_path)
+    return b64, mime
 
 
 def _vision_call_with_timeout(fn, *args, timeout_sec: float, **kwargs):
@@ -4891,6 +4915,164 @@ def _normalize_outfit_scan_categoria(categoria: str, nome: str, scan_raw) -> str
     return "topBase"
 
 
+def _parse_outfit_scan_crop_confidence(raw: dict) -> float | None:
+    if "cropConfidence" not in raw:
+        return None
+    try:
+        conf = float(raw.get("cropConfidence"))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, conf))
+
+
+def _parse_outfit_scan_crop_box(raw: dict, crop_confidence: float | None) -> dict | None:
+    box_raw = raw.get("cropBox")
+    if not isinstance(box_raw, dict):
+        return None
+    if crop_confidence is None or crop_confidence < _OUTFIT_SCAN_CROP_MIN_CONFIDENCE:
+        return None
+    try:
+        x = float(box_raw.get("x"))
+        y = float(box_raw.get("y"))
+        width = float(box_raw.get("width"))
+        height = float(box_raw.get("height"))
+    except (TypeError, ValueError):
+        return None
+    if any(v < 0.0 or v > 1.0 for v in (x, y, width, height)):
+        return None
+    if width < _OUTFIT_SCAN_CROP_MIN_BOX_DIM or height < _OUTFIT_SCAN_CROP_MIN_BOX_DIM:
+        return None
+    if x + width > 1.0001 or y + height > 1.0001:
+        return None
+    if width * height < _OUTFIT_SCAN_CROP_MIN_BOX_AREA:
+        return None
+    return {
+        "x": round(x, 6),
+        "y": round(y, 6),
+        "width": round(width, 6),
+        "height": round(height, 6),
+    }
+
+
+def _apply_outfit_scan_crop_padding(box: dict) -> dict:
+    x, y, w, h = box["x"], box["y"], box["width"], box["height"]
+    pad_w = w * _OUTFIT_SCAN_CROP_PADDING_RATIO
+    pad_h = h * _OUTFIT_SCAN_CROP_PADDING_RATIO
+    x1 = max(0.0, x - pad_w)
+    y1 = max(0.0, y - pad_h)
+    x2 = min(1.0, x + w + pad_w)
+    y2 = min(1.0, y + h + pad_h)
+    return {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
+
+
+def _crop_outfit_scan_image(img: Image.Image, box: dict) -> Image.Image | None:
+    padded = _apply_outfit_scan_crop_padding(box)
+    iw, ih = img.size
+    left = max(0, int(padded["x"] * iw))
+    top = max(0, int(padded["y"] * ih))
+    right = min(iw, max(left + 1, int(round((padded["x"] + padded["width"]) * iw))))
+    bottom = min(ih, max(top + 1, int(round((padded["y"] + padded["height"]) * ih))))
+    if right - left < _OUTFIT_SCAN_CROP_MIN_PIXELS or bottom - top < _OUTFIT_SCAN_CROP_MIN_PIXELS:
+        return None
+    return img.crop((left, top, right, bottom))
+
+
+def _jpeg_bytes_from_outfit_scan_crop(img: Image.Image) -> bytes:
+    out = BytesIO()
+    rgb = img.convert("RGB") if img.mode != "RGB" else img
+    rgb.save(out, format="JPEG", quality=88, optimize=True)
+    return out.getvalue()
+
+
+def _upload_outfit_scan_crop(uid: str, scan_session_id: str, temp_id: str, jpeg_bytes: bytes) -> str:
+    safe_scan = re.sub(r"[^a-zA-Z0-9_-]", "_", scan_session_id)[:64]
+    safe_temp = re.sub(r"[^a-zA-Z0-9_-]", "_", temp_id)[:64]
+    path = f"users/{uid}/clothing_items/outfit_scan_{safe_scan}_{safe_temp}.jpg"
+    blob = bucket.blob(path)
+    token = str(uuid.uuid4())
+    blob.metadata = {"firebaseStorageDownloadTokens": token}
+    blob.upload_from_string(jpeg_bytes, content_type="image/jpeg")
+    return (
+        f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_BUCKET}"
+        f"/o/{path.replace('/', '%2F')}?alt=media&token={token}"
+    )
+
+
+def _outfit_scan_attach_crop_fields(item: dict, crop_box: dict | None, crop_confidence: float | None) -> None:
+    item["cropConfidence"] = crop_confidence
+    item["imageUrl"] = ""
+    item["needsPhoto"] = True
+    if crop_box:
+        item["cropBox"] = crop_box
+        item["cropStatus"] = "ready_candidate"
+    else:
+        item["cropBox"] = None
+        item["cropStatus"] = "skipped"
+
+
+def _outfit_scan_process_crops(
+    items: list[dict],
+    img: Image.Image,
+    uid: str,
+    scan_session_id: str,
+    deadline: float,
+) -> None:
+    crop_count = 0
+    time_exhausted = False
+    for item in items:
+        if item.get("cropStatus") != "ready_candidate":
+            continue
+        if time_exhausted or crop_count >= _OUTFIT_SCAN_MAX_CROP_ITEMS:
+            item["cropStatus"] = "skipped"
+            item["imageUrl"] = ""
+            item["needsPhoto"] = True
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= _OUTFIT_SCAN_CROP_TIME_RESERVE_SEC:
+            time_exhausted = True
+            item["cropStatus"] = "skipped"
+            item["imageUrl"] = ""
+            item["needsPhoto"] = True
+            continue
+        crop_box = item.get("cropBox")
+        if not crop_box:
+            item["cropStatus"] = "skipped"
+            item["imageUrl"] = ""
+            item["needsPhoto"] = True
+            continue
+        try:
+            cropped = _crop_outfit_scan_image(img, crop_box)
+            if cropped is None:
+                item["cropStatus"] = "failed"
+                item["imageUrl"] = ""
+                item["needsPhoto"] = True
+                continue
+            jpeg_bytes = _jpeg_bytes_from_outfit_scan_crop(cropped)
+            image_url = _upload_outfit_scan_crop(uid, scan_session_id, item["tempId"], jpeg_bytes)
+            item["imageUrl"] = image_url
+            item["needsPhoto"] = False
+            item["cropStatus"] = "ready"
+            crop_count += 1
+        except Exception as e:
+            print(
+                f"[outfit-scan] crop/upload failed tempId={item.get('tempId')}: "
+                f"{type(e).__name__}: {e}"
+            )
+            item["cropStatus"] = "failed"
+            item["imageUrl"] = ""
+            item["needsPhoto"] = True
+
+
+def _outfit_scan_response_status(items: list[dict], vision_ok: bool) -> str:
+    if not vision_ok or not items:
+        return "vision_error"
+    ready = sum(1 for i in items if i.get("cropStatus") == "ready")
+    not_ready = sum(1 for i in items if i.get("cropStatus") in ("skipped", "failed"))
+    if ready > 0 and not_ready > 0:
+        return "partial"
+    return "ok"
+
+
 def _normalize_outfit_scan_item(raw: dict, idx: int) -> dict | None:
     nome = str(raw.get("nome") or "").strip()
     if not nome:
@@ -4917,7 +5099,9 @@ def _normalize_outfit_scan_item(raw: dict, idx: int) -> dict | None:
     conf = max(0.0, min(1.0, conf))
     if conf < _OUTFIT_SCAN_VISION_MIN_CONFIDENCE:
         return None
-    return {
+    crop_confidence = _parse_outfit_scan_crop_confidence(raw)
+    crop_box = _parse_outfit_scan_crop_box(raw, crop_confidence)
+    item = {
         "tempId": str(raw.get("tempId") or f"scan-{uuid.uuid4().hex[:8]}-{idx}"),
         "nome": nome,
         "categoria": categoria,
@@ -4928,6 +5112,8 @@ def _normalize_outfit_scan_item(raw: dict, idx: int) -> dict | None:
         "scanConfidence": conf,
         "scanRawLabel": scan_raw,
     }
+    _outfit_scan_attach_crop_fields(item, crop_box, crop_confidence)
+    return item
 
 
 def _parse_vision_items_response(raw_text: str) -> list[dict]:
@@ -5015,10 +5201,15 @@ def _call_gemini_outfit_vision(b64: str, mime: str, lang: str, timeout_sec: floa
     return str(parts[0].get("text") or "").strip()
 
 
-def _run_outfit_scan_vision(image_path: str, lang: str) -> tuple[list[dict], str, str]:
+def _run_outfit_scan_vision(
+    image_path: str,
+    lang: str,
+    uid: str,
+    scan_session_id: str,
+) -> tuple[list[dict], str, str]:
     """
-    Scarica l'immagine da Storage, chiama il provider Vision, normalizza items.
-    Ritorna (items, status, provider) con status 'ok' o 'vision_error'.
+    Scarica l'immagine da Storage, chiama il provider Vision, normalizza items, auto-crop.
+    Ritorna (items, status, provider) con status 'ok', 'partial' o 'vision_error'.
     """
     provider = VISION_PROVIDER
     if provider not in ("openai", "gemini"):
@@ -5029,7 +5220,7 @@ def _run_outfit_scan_vision(image_path: str, lang: str) -> tuple[list[dict], str
         return [], "vision_error", provider
 
     try:
-        b64, mime = _download_storage_image_b64(image_path)
+        img, b64, mime = _load_outfit_scan_image(image_path)
     except Exception as e:
         print(f"[outfit-scan] storage download failed: {type(e).__name__}: {e}")
         return [], "vision_error", provider
@@ -5048,7 +5239,9 @@ def _run_outfit_scan_vision(image_path: str, lang: str) -> tuple[list[dict], str
             )
             items = _parse_vision_items_response(raw_text)
             if items:
-                return items, "ok", provider
+                _outfit_scan_process_crops(items, img, uid, scan_session_id, deadline)
+                status = _outfit_scan_response_status(items, True)
+                return items, status, provider
             print(f"[outfit-scan] vision attempt {attempt + 1}: parsed 0 items")
         except TimeoutError as e:
             print(f"[outfit-scan] vision attempt {attempt + 1} timeout: {e}")
@@ -5102,7 +5295,7 @@ async def outfit_scan(request: Request, body: OutfitScanBody):
 
     if OUTFIT_SCAN_USE_VISION:
         items, status, provider = await asyncio.to_thread(
-            _run_outfit_scan_vision, image_path, lang
+            _run_outfit_scan_vision, image_path, lang, uid, scan_session_id
         )
     else:
         items = _outfit_scan_mock_items()
