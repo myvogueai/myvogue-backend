@@ -4748,11 +4748,22 @@ _OUTFIT_SCAN_VALID_STILI = frozenset({"casual", "elegante", "streetwear", "sport
 _OUTFIT_SCAN_VALID_STAGIONI = frozenset({"primavera", "estate", "autunno", "inverno"})
 _OUTFIT_SCAN_VISION_MAX_EDGE = 1280
 _OUTFIT_SCAN_VISION_MIN_CONFIDENCE = 0.4
-_OUTFIT_SCAN_CROP_MIN_CONFIDENCE = 0.6
+_OUTFIT_SCAN_CROP_POLICY = {
+    "topBase": {"enabled": True, "min_conf": 0.65, "padding": 0.10, "edge_margin": 0.02},
+    "bottom": {"enabled": True, "min_conf": 0.65, "padding": 0.10, "edge_margin": 0.02},
+    "topLayer": {"enabled": True, "min_conf": 0.70, "padding": 0.12, "edge_margin": 0.02},
+    "pezzoUnico": {"enabled": True, "min_conf": 0.75, "padding": 0.15, "edge_margin": 0.02},
+    "scarpe": {"enabled": False},
+}
+_OUTFIT_SCAN_CROP_GEOMETRY = {
+    "topBase": {"min_area": 0.008, "max_area": 0.55, "min_aspect": 0.35, "max_aspect": 2.8, "max_cy": 0.72},
+    "bottom": {"min_area": 0.008, "max_area": 0.55, "min_aspect": 0.25, "max_aspect": 1.8, "min_y": 0.18, "max_y_end": 0.98, "max_cy": 0.88},
+    "topLayer": {"min_area": 0.010, "max_area": 0.65, "min_aspect": 0.35, "max_aspect": 2.8, "max_cy": 0.75},
+    "pezzoUnico": {"min_area": 0.015, "max_area": 0.80, "min_aspect": 0.20, "max_aspect": 1.2},
+}
 _OUTFIT_SCAN_CROP_MIN_BOX_DIM = 0.04
-_OUTFIT_SCAN_CROP_MIN_BOX_AREA = 0.008
-_OUTFIT_SCAN_CROP_PADDING_RATIO = 0.10
 _OUTFIT_SCAN_CROP_MIN_PIXELS = 50
+_OUTFIT_SCAN_CROP_MAX_OUTPUT_ASPECT = 3.5
 _OUTFIT_SCAN_CROP_TIME_RESERVE_SEC = 8.0
 _OUTFIT_SCAN_MAX_CROP_ITEMS = 6
 
@@ -4832,7 +4843,11 @@ def _outfit_scan_vision_prompt(lang: str) -> str:
         "- NON inventare box. Se il box è incerto, ometti cropBox e cropConfidence.\n"
         "- cropConfidence 0.0-1.0: confidenza sul bounding box.\n"
         "- Non includere cropBox con cropConfidence sotto 0.6.\n"
-        "- Il box deve contenere principalmente il capo, non volto/sfondo/specchio.\n\n"
+        "- Il box deve contenere principalmente il capo, non volto/sfondo/specchio.\n"
+        "- Per tutti i capi: se il capo tocca il bordo dell'immagine, ometti cropBox.\n"
+        "- Meglio omettere cropBox che restituire un box parziale o incerto.\n"
+        "- Per scarpe/sneakers: cropBox solo se entrambe le scarpe sono interamente visibili.\n"
+        "- Per scarpe/sneakers: se anche una scarpa è tagliata dal bordo foto, ometti cropBox.\n\n"
         "Regole categoriche:\n"
         "- blazer, giacca, cappotto, cardigan, giubbotto = topLayer\n"
         "- camicia, t-shirt, maglia, polo, top = topBase\n"
@@ -4925,11 +4940,82 @@ def _parse_outfit_scan_crop_confidence(raw: dict) -> float | None:
     return max(0.0, min(1.0, conf))
 
 
-def _parse_outfit_scan_crop_box(raw: dict, crop_confidence: float | None) -> dict | None:
+def _outfit_scan_crop_policy(categoria: str) -> dict:
+    return _OUTFIT_SCAN_CROP_POLICY.get(categoria, _OUTFIT_SCAN_CROP_POLICY["topBase"])
+
+
+def _outfit_scan_log_crop_skip(categoria: str, reason: str, temp_id: str | None = None) -> None:
+    suffix = f" tempId={temp_id}" if temp_id else ""
+    print(f"[outfit-scan] crop skipped category={categoria} reason={reason}{suffix}")
+
+
+def _outfit_scan_box_near_edge(box: dict, edge_margin: float) -> bool:
+    x, y, w, h = box["x"], box["y"], box["width"], box["height"]
+    if x < edge_margin or y < edge_margin:
+        return True
+    if (x + w) > (1.0 - edge_margin):
+        return True
+    if (y + h) > (1.0 - edge_margin):
+        return True
+    return False
+
+
+def _outfit_scan_box_aspect(box: dict) -> float:
+    w, h = box["width"], box["height"]
+    if h <= 0:
+        return 0.0
+    return w / h
+
+
+def _outfit_scan_validate_crop_box(
+    box: dict,
+    categoria: str,
+    crop_confidence: float | None,
+) -> tuple[dict | None, str | None]:
+    policy = _outfit_scan_crop_policy(categoria)
+    if not policy.get("enabled", False):
+        return None, "disabled"
+    if crop_confidence is None:
+        return None, "missing_crop_confidence"
+    min_conf = policy.get("min_conf", 0.65)
+    if crop_confidence < min_conf:
+        return None, f"low_crop_confidence<{min_conf}"
+    edge_margin = policy.get("edge_margin", 0.02)
+    if _outfit_scan_box_near_edge(box, edge_margin):
+        return None, "edge_margin"
+    geom = _OUTFIT_SCAN_CROP_GEOMETRY.get(categoria, {})
+    area = box["width"] * box["height"]
+    min_area = geom.get("min_area", 0.008)
+    max_area = geom.get("max_area", 0.55)
+    if area < min_area:
+        return None, "area_too_small"
+    if area > max_area:
+        return None, "area_too_large"
+    aspect = _outfit_scan_box_aspect(box)
+    min_aspect = geom.get("min_aspect", 0.2)
+    max_aspect = geom.get("max_aspect", 3.0)
+    if aspect < min_aspect or aspect > max_aspect:
+        return None, "aspect_ratio"
+    cy = box["y"] + box["height"] / 2.0
+    if "max_cy" in geom and cy > geom["max_cy"]:
+        return None, "vertical_position"
+    if "min_y" in geom and box["y"] < geom["min_y"]:
+        return None, "vertical_position"
+    if "max_y_end" in geom and (box["y"] + box["height"]) > geom["max_y_end"]:
+        return None, "vertical_position"
+    if box["width"] < _OUTFIT_SCAN_CROP_MIN_BOX_DIM or box["height"] < _OUTFIT_SCAN_CROP_MIN_BOX_DIM:
+        return None, "box_too_small"
+    return box, None
+
+
+def _parse_outfit_scan_crop_box(
+    raw: dict,
+    crop_confidence: float | None,
+    categoria: str,
+    temp_id: str | None = None,
+) -> dict | None:
     box_raw = raw.get("cropBox")
     if not isinstance(box_raw, dict):
-        return None
-    if crop_confidence is None or crop_confidence < _OUTFIT_SCAN_CROP_MIN_CONFIDENCE:
         return None
     try:
         x = float(box_raw.get("x"))
@@ -4937,27 +5023,32 @@ def _parse_outfit_scan_crop_box(raw: dict, crop_confidence: float | None) -> dic
         width = float(box_raw.get("width"))
         height = float(box_raw.get("height"))
     except (TypeError, ValueError):
+        _outfit_scan_log_crop_skip(categoria, "invalid_box_values", temp_id)
         return None
     if any(v < 0.0 or v > 1.0 for v in (x, y, width, height)):
-        return None
-    if width < _OUTFIT_SCAN_CROP_MIN_BOX_DIM or height < _OUTFIT_SCAN_CROP_MIN_BOX_DIM:
+        _outfit_scan_log_crop_skip(categoria, "box_out_of_range", temp_id)
         return None
     if x + width > 1.0001 or y + height > 1.0001:
+        _outfit_scan_log_crop_skip(categoria, "box_out_of_range", temp_id)
         return None
-    if width * height < _OUTFIT_SCAN_CROP_MIN_BOX_AREA:
-        return None
-    return {
+    box = {
         "x": round(x, 6),
         "y": round(y, 6),
         "width": round(width, 6),
         "height": round(height, 6),
     }
+    validated, reason = _outfit_scan_validate_crop_box(box, categoria, crop_confidence)
+    if validated is None and reason:
+        _outfit_scan_log_crop_skip(categoria, reason, temp_id)
+    return validated
 
 
-def _apply_outfit_scan_crop_padding(box: dict) -> dict:
+def _apply_outfit_scan_crop_padding(box: dict, categoria: str) -> dict:
+    policy = _outfit_scan_crop_policy(categoria)
+    padding = policy.get("padding", 0.10)
     x, y, w, h = box["x"], box["y"], box["width"], box["height"]
-    pad_w = w * _OUTFIT_SCAN_CROP_PADDING_RATIO
-    pad_h = h * _OUTFIT_SCAN_CROP_PADDING_RATIO
+    pad_w = w * padding
+    pad_h = h * padding
     x1 = max(0.0, x - pad_w)
     y1 = max(0.0, y - pad_h)
     x2 = min(1.0, x + w + pad_w)
@@ -4965,16 +5056,40 @@ def _apply_outfit_scan_crop_padding(box: dict) -> dict:
     return {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
 
 
-def _crop_outfit_scan_image(img: Image.Image, box: dict) -> Image.Image | None:
-    padded = _apply_outfit_scan_crop_padding(box)
+def _outfit_scan_validate_padded_box(padded: dict, categoria: str) -> str | None:
+    policy = _outfit_scan_crop_policy(categoria)
+    edge_margin = policy.get("edge_margin", 0.02)
+    if _outfit_scan_box_near_edge(padded, edge_margin):
+        return "padded_edge_touch"
+    aspect = _outfit_scan_box_aspect(padded)
+    if aspect > 0:
+        long_side = max(aspect, 1.0 / aspect)
+        if long_side > _OUTFIT_SCAN_CROP_MAX_OUTPUT_ASPECT:
+            return "padded_strip"
+    return None
+
+
+def _crop_outfit_scan_image(
+    img: Image.Image,
+    box: dict,
+    categoria: str,
+) -> tuple[Image.Image | None, str | None]:
+    padded = _apply_outfit_scan_crop_padding(box, categoria)
+    padded_reason = _outfit_scan_validate_padded_box(padded, categoria)
+    if padded_reason:
+        return None, padded_reason
     iw, ih = img.size
     left = max(0, int(padded["x"] * iw))
     top = max(0, int(padded["y"] * ih))
     right = min(iw, max(left + 1, int(round((padded["x"] + padded["width"]) * iw))))
     bottom = min(ih, max(top + 1, int(round((padded["y"] + padded["height"]) * ih))))
     if right - left < _OUTFIT_SCAN_CROP_MIN_PIXELS or bottom - top < _OUTFIT_SCAN_CROP_MIN_PIXELS:
-        return None
-    return img.crop((left, top, right, bottom))
+        return None, "output_too_small"
+    cropped = img.crop((left, top, right, bottom))
+    cw, ch = cropped.size
+    if max(cw, ch) / max(1, min(cw, ch)) > _OUTFIT_SCAN_CROP_MAX_OUTPUT_ASPECT:
+        return None, "output_strip"
+    return cropped, None
 
 
 def _jpeg_bytes_from_outfit_scan_crop(img: Image.Image) -> bytes:
@@ -4999,9 +5114,16 @@ def _upload_outfit_scan_crop(uid: str, scan_session_id: str, temp_id: str, jpeg_
 
 
 def _outfit_scan_attach_crop_fields(item: dict, crop_box: dict | None, crop_confidence: float | None) -> None:
+    categoria = item.get("categoria", "topBase")
+    policy = _outfit_scan_crop_policy(categoria)
     item["cropConfidence"] = crop_confidence
     item["imageUrl"] = ""
     item["needsPhoto"] = True
+    if not policy.get("enabled", False):
+        item["cropBox"] = None
+        item["cropStatus"] = "skipped"
+        _outfit_scan_log_crop_skip(categoria, "disabled", item.get("tempId"))
+        return
     if crop_box:
         item["cropBox"] = crop_box
         item["cropStatus"] = "ready_candidate"
@@ -5026,6 +5148,11 @@ def _outfit_scan_process_crops(
             item["cropStatus"] = "skipped"
             item["imageUrl"] = ""
             item["needsPhoto"] = True
+            _outfit_scan_log_crop_skip(
+                item.get("categoria", "topBase"),
+                "time_or_count_limit",
+                item.get("tempId"),
+            )
             continue
         remaining = deadline - time.monotonic()
         if remaining <= _OUTFIT_SCAN_CROP_TIME_RESERVE_SEC:
@@ -5033,6 +5160,11 @@ def _outfit_scan_process_crops(
             item["cropStatus"] = "skipped"
             item["imageUrl"] = ""
             item["needsPhoto"] = True
+            _outfit_scan_log_crop_skip(
+                item.get("categoria", "topBase"),
+                "time_budget",
+                item.get("tempId"),
+            )
             continue
         crop_box = item.get("cropBox")
         if not crop_box:
@@ -5040,12 +5172,18 @@ def _outfit_scan_process_crops(
             item["imageUrl"] = ""
             item["needsPhoto"] = True
             continue
+        categoria = item.get("categoria", "topBase")
         try:
-            cropped = _crop_outfit_scan_image(img, crop_box)
+            cropped, skip_reason = _crop_outfit_scan_image(img, crop_box, categoria)
             if cropped is None:
-                item["cropStatus"] = "failed"
+                item["cropStatus"] = "skipped"
                 item["imageUrl"] = ""
                 item["needsPhoto"] = True
+                _outfit_scan_log_crop_skip(
+                    categoria,
+                    skip_reason or "crop_failed",
+                    item.get("tempId"),
+                )
                 continue
             jpeg_bytes = _jpeg_bytes_from_outfit_scan_crop(cropped)
             image_url = _upload_outfit_scan_crop(uid, scan_session_id, item["tempId"], jpeg_bytes)
@@ -5099,10 +5237,15 @@ def _normalize_outfit_scan_item(raw: dict, idx: int) -> dict | None:
     conf = max(0.0, min(1.0, conf))
     if conf < _OUTFIT_SCAN_VISION_MIN_CONFIDENCE:
         return None
+    temp_id = str(raw.get("tempId") or f"scan-{uuid.uuid4().hex[:8]}-{idx}")
     crop_confidence = _parse_outfit_scan_crop_confidence(raw)
-    crop_box = _parse_outfit_scan_crop_box(raw, crop_confidence)
+    policy = _outfit_scan_crop_policy(categoria)
+    if policy.get("enabled"):
+        crop_box = _parse_outfit_scan_crop_box(raw, crop_confidence, categoria, temp_id)
+    else:
+        crop_box = None
     item = {
-        "tempId": str(raw.get("tempId") or f"scan-{uuid.uuid4().hex[:8]}-{idx}"),
+        "tempId": temp_id,
         "nome": nome,
         "categoria": categoria,
         "colore": colore,
