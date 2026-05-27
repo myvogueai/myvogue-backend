@@ -4251,21 +4251,34 @@ def _qp_pick_variants(
     variant_count: int,
     stile_l: str,
     occasion_n: str | None,
-) -> list[tuple[str, float, dict]]:
-    """Seleziona fino a variant_count varianti distinte (safe → creative → elegant)."""
+) -> tuple[list[tuple[str, float, dict]], dict]:
+    """Seleziona fino a variant_count varianti distinte (safe → creative → elegant).
+
+    Ogni variante usa una signature (_qp_candidate_sig) unica se esiste un candidato
+    alternativo; dopo safe, richiede anche diversità di slot (bottom/shoes/layer).
+    Se un asse non ha alternative reali, viene saltato (variantsAvailable onesto).
+    """
     axes = list(_QUICKPAIR_VARIANT_AXES)[: max(1, min(variant_count, len(_QUICKPAIR_VARIANT_AXES)))]
     deduped = _qp_dedupe_candidates(pool)
+    meta = {
+        "dedupedPool": len(deduped),
+        "requestedAxes": len(axes),
+        "skippedAxes": [],
+        "uniqueSigs": 0,
+    }
     if not deduped:
-        return []
+        return [], meta
 
     chosen: list[tuple[str, float, dict]] = []
     used_sigs: set[tuple] = set()
 
     for axis in axes:
-        scored: list[tuple[float, float, dict, tuple, bool]] = []
+        scored: list[tuple[float, float, dict, tuple]] = []
         for base_sc, cand in deduped:
             sig = _qp_candidate_sig(cand)
             if sig in used_sigs:
+                continue
+            if chosen and not all(_qp_slots_differ(cand, prev) for _, _, prev in chosen):
                 continue
             axis_sc = _qp_variant_axis_score(cand, axis, base_sc, stile_l, occasion_n)
             overlap_pen = sum(
@@ -4273,20 +4286,19 @@ def _qp_pick_variants(
                 for _, _, prev in chosen
             )
             adj = axis_sc - overlap_pen
-            diverse = not chosen or any(_qp_slots_differ(cand, prev) for _, _, prev in chosen)
-            scored.append((adj, base_sc, cand, sig, diverse))
+            scored.append((adj, base_sc, cand, sig))
 
         if not scored:
-            break
+            meta["skippedAxes"].append(axis)
+            continue
 
-        diverse_pool = [row for row in scored if row[4]]
-        pick_from = diverse_pool if diverse_pool else scored
-        pick_from.sort(key=lambda x: x[0], reverse=True)
-        adj, _base_sc, cand, sig, _ = pick_from[0]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        adj, _base_sc, cand, sig = scored[0]
         chosen.append((axis, adj, cand))
         used_sigs.add(sig)
 
-    return chosen
+    meta["uniqueSigs"] = len(used_sigs)
+    return chosen, meta
 
 
 def _qp_variant_reason_prefix(variant: str, lang: str) -> str:
@@ -4904,7 +4916,7 @@ async def quickpair(
         filtered = [(s, c) for s, c in top_candidates if s >= best_score - _SCORE_MARGIN]
 
         if multi_variant:
-            picked = _qp_pick_variants(
+            picked, pick_meta = _qp_pick_variants(
                 filtered,
                 variant_count=variants,
                 stile_l=stile_l,
@@ -4946,11 +4958,15 @@ async def quickpair(
             primary = variants_payload[0]
             selected_score = primary["score"]
             selected_rank = 1
+            skipped = pick_meta.get("skippedAxes") or []
+            skipped_txt = ",".join(skipped) if skipped else "-"
             debug_reason = (
                 f"variants={variants};available={len(variants_payload)};"
+                f"uniqueSigs={pick_meta.get('uniqueSigs', len(variants_payload))};"
+                f"skippedAxes={skipped_txt};"
                 f"same_style_pool;base_cat={base.get('categoria')};"
                 f"items={len(items)};best_score={best_score:.4f};"
-                f"topCandidates={len(filtered)};deduped={len(_qp_dedupe_candidates(filtered))}"
+                f"topCandidates={len(filtered)};deduped={pick_meta.get('dedupedPool', 0)}"
             )
 
             payload = {
