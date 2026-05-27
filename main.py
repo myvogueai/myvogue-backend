@@ -4766,6 +4766,7 @@ _OUTFIT_SCAN_CROP_MIN_PIXELS = 50
 _OUTFIT_SCAN_CROP_MAX_OUTPUT_ASPECT = 3.5
 _OUTFIT_SCAN_CROP_TIME_RESERVE_SEC = 8.0
 _OUTFIT_SCAN_MAX_CROP_ITEMS = 6
+_OUTFIT_SCAN_AUTO_CROP_ENABLED = False
 
 
 def _outfit_scan_mock_items() -> list[dict]:
@@ -5113,7 +5114,20 @@ def _upload_outfit_scan_crop(uid: str, scan_session_id: str, temp_id: str, jpeg_
     )
 
 
+def _outfit_scan_finalize_item_fields(item: dict) -> None:
+    """Outfit Scan salva solo bozze capi: nessun crop indossato come imageUrl."""
+    item["imageUrl"] = ""
+    item["needsPhoto"] = True
+    item["cropStatus"] = "skipped"
+    item["cropSource"] = "manual_pending"
+    item["cropBox"] = None
+    item.pop("cropConfidence", None)
+
+
 def _outfit_scan_attach_crop_fields(item: dict, crop_box: dict | None, crop_confidence: float | None) -> None:
+    if not _OUTFIT_SCAN_AUTO_CROP_ENABLED:
+        _outfit_scan_finalize_item_fields(item)
+        return
     categoria = item.get("categoria", "topBase")
     policy = _outfit_scan_crop_policy(categoria)
     item["cropConfidence"] = crop_confidence
@@ -5238,12 +5252,13 @@ def _normalize_outfit_scan_item(raw: dict, idx: int) -> dict | None:
     if conf < _OUTFIT_SCAN_VISION_MIN_CONFIDENCE:
         return None
     temp_id = str(raw.get("tempId") or f"scan-{uuid.uuid4().hex[:8]}-{idx}")
-    crop_confidence = _parse_outfit_scan_crop_confidence(raw)
-    policy = _outfit_scan_crop_policy(categoria)
-    if policy.get("enabled"):
-        crop_box = _parse_outfit_scan_crop_box(raw, crop_confidence, categoria, temp_id)
-    else:
-        crop_box = None
+    crop_box = None
+    crop_confidence = None
+    if _OUTFIT_SCAN_AUTO_CROP_ENABLED:
+        crop_confidence = _parse_outfit_scan_crop_confidence(raw)
+        policy = _outfit_scan_crop_policy(categoria)
+        if policy.get("enabled"):
+            crop_box = _parse_outfit_scan_crop_box(raw, crop_confidence, categoria, temp_id)
     item = {
         "tempId": temp_id,
         "nome": nome,
@@ -5382,7 +5397,11 @@ def _run_outfit_scan_vision(
             )
             items = _parse_vision_items_response(raw_text)
             if items:
-                _outfit_scan_process_crops(items, img, uid, scan_session_id, deadline)
+                if _OUTFIT_SCAN_AUTO_CROP_ENABLED:
+                    _outfit_scan_process_crops(items, img, uid, scan_session_id, deadline)
+                else:
+                    for item in items:
+                        _outfit_scan_finalize_item_fields(item)
                 status = _outfit_scan_response_status(items, True)
                 return items, status, provider
             print(f"[outfit-scan] vision attempt {attempt + 1}: parsed 0 items")
@@ -5444,6 +5463,9 @@ async def outfit_scan(request: Request, body: OutfitScanBody):
         items = _outfit_scan_mock_items()
         status = "mock"
         provider = "mock"
+
+    for item in items:
+        _outfit_scan_finalize_item_fields(item)
 
     return JSONResponse(
         content={
