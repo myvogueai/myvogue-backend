@@ -2291,6 +2291,12 @@ def _color_raw_for_score_v1(item) -> str | None:
     return str(c).strip()
 
 
+def _color_for_compat(item: dict) -> str:
+    """Fonte colore unica per are_compatible — usa la stessa logica colore dello scoring v1."""
+    raw = _color_raw_for_score_v1(item) or item.get("colore", "")
+    return normalize_color(raw)
+
+
 # =============================================================================
 # DEPRECATED / DO NOT USE IN PRODUCTION
 #
@@ -2603,6 +2609,40 @@ def _best_layer_for_outfit(
     if best_layer is not None and best_sc >= base_sc + _LAYER_MIN_GAIN:
         return best_layer, best_sc
     return None, base_sc
+
+
+def _pick_best_shoe_for_outfit(
+    compat_s: list,
+    rnd: random.Random,
+    *,
+    top=None,
+    bottom=None,
+    piece=None,
+    prefer_palette: list[str] | None = None,
+    target_style: str | None = None,
+):
+    """Sceglie la scarpa con outfit_score più alto; tie-break casuale solo tra pari."""
+    if not compat_s:
+        return None
+    scored = [
+        (
+            outfit_score(
+                top=top,
+                bottom=bottom,
+                piece=piece,
+                shoes=sh,
+                layer=None,
+                prefer_palette=prefer_palette,
+                target_style=target_style,
+                base_item=None,
+            ),
+            sh,
+        )
+        for sh in compat_s
+    ]
+    best_sc = max(s for s, _ in scored)
+    top_shoes = [sh for s, sh in scored if s == best_sc]
+    return rnd.choice(top_shoes)
 
 
 # ------------------------------
@@ -3511,11 +3551,11 @@ async def genera_outfit(
             if pezzo and scarpe:
                 for p in rnd.sample(pezzo, k=min(len(pezzo), 12)):
                     sample_shoes = rnd.sample(scarpe, k=min(len(scarpe), 12))
-                    compat_shoes_p = [sh for sh in sample_shoes if are_compatible(p.get("colore"), sh.get("colore"))] or sample_shoes
+                    compat_shoes_p = [sh for sh in sample_shoes if are_compatible(_color_for_compat(p), _color_for_compat(sh))] or sample_shoes
                     for sh in compat_shoes_p:
                         compat_layers = [
                             l for l in toplayer
-                            if are_compatible(p.get("colore"), l.get("colore"))
+                            if are_compatible(_color_for_compat(p), _color_for_compat(l))
                         ]
                         cand_layer, score = _best_layer_for_outfit(
                             compat_layers,
@@ -3544,24 +3584,33 @@ async def genera_outfit(
                 for t in sample_tops:
                     compat_b = [
                         b for b in sample_bottoms
-                        if are_compatible(t.get("colore"), b.get("colore"))
+                        if are_compatible(_color_for_compat(t), _color_for_compat(b))
                     ] or sample_bottoms
 
                     for b in compat_b:
                         compat_s = [
                             s for s in sample_shoes
-                            if are_compatible(b.get("colore"), s.get("colore"))
+                            if are_compatible(_color_for_compat(b), _color_for_compat(s))
                         ] or sample_shoes
 
                         compat_l = [
                             l for l in toplayer
                             if (
-                                are_compatible(l.get("colore"), t.get("colore")) or
-                                are_compatible(l.get("colore"), b.get("colore"))
+                                are_compatible(_color_for_compat(l), _color_for_compat(t)) or
+                                are_compatible(_color_for_compat(l), _color_for_compat(b))
                             )
                         ]
 
-                        sh = rnd.choice(compat_s)
+                        sh = _pick_best_shoe_for_outfit(
+                            compat_s,
+                            rnd,
+                            top=t,
+                            bottom=b,
+                            prefer_palette=prefer_palette,
+                            target_style=stile_l_req,
+                        )
+                        if sh is None:
+                            continue
                         cand_layer, score = _best_layer_for_outfit(
                             compat_l,
                             top=t,
@@ -3853,11 +3902,11 @@ async def genera_outfit(
             if pezzo and scarpe:
                 for p in rnd.sample(pezzo, k=min(len(pezzo), 12)):
                     sample_shoes_p = rnd.sample(scarpe, k=min(len(scarpe), 12))
-                    compat_shoes_p = [sh for sh in sample_shoes_p if are_compatible(p.get("colore"), sh.get("colore"))] or sample_shoes_p
+                    compat_shoes_p = [sh for sh in sample_shoes_p if are_compatible(_color_for_compat(p), _color_for_compat(sh))] or sample_shoes_p
                     for sh in compat_shoes_p:
                         compat_layers = [
                             l for l in toplayer
-                            if are_compatible(p.get("colore"), l.get("colore"))
+                            if are_compatible(_color_for_compat(p), _color_for_compat(l))
                         ]
                         cand_layer, score = _best_layer_for_outfit(
                             compat_layers,
@@ -3885,23 +3934,32 @@ async def genera_outfit(
                 for t in sample_tops:
                     compat_b = [
                         b for b in sample_bottoms
-                        if are_compatible(t.get("colore"), b.get("colore"))
+                        if are_compatible(_color_for_compat(t), _color_for_compat(b))
                     ] or sample_bottoms
 
                     for b in compat_b:
                         compat_s = [
                             s for s in sample_shoes
-                            if are_compatible(b.get("colore"), s.get("colore"))
+                            if are_compatible(_color_for_compat(b), _color_for_compat(s))
                         ] or sample_shoes
 
                         compat_l = [
                             l for l in toplayer
                             if (
-                                are_compatible(l.get("colore"), t.get("colore")) or
-                                are_compatible(l.get("colore"), b.get("colore"))
+                                are_compatible(_color_for_compat(l), _color_for_compat(t)) or
+                                are_compatible(_color_for_compat(l), _color_for_compat(b))
                             )
                         ]
-                        sh = rnd.choice(compat_s)
+                        sh = _pick_best_shoe_for_outfit(
+                            compat_s,
+                            rnd,
+                            top=t,
+                            bottom=b,
+                            prefer_palette=prefer_palette,
+                            target_style=stile_l,
+                        )
+                        if sh is None:
+                            continue
                         cand_layer, score = _best_layer_for_outfit(
                             compat_l,
                             top=t,
@@ -4648,9 +4706,9 @@ async def quickpair(
 
         if base.get("categoria") == "pezzoUnico":
             for sh in scarpe:
-                if not are_compatible(base.get("colore"), sh.get("colore")):
+                if not are_compatible(_color_for_compat(base), _color_for_compat(sh)):
                     continue
-                compat_layers = [l for l in topLayer if are_compatible(base.get("colore"), l.get("colore"))]
+                compat_layers = [l for l in topLayer if are_compatible(_color_for_compat(base), _color_for_compat(l))]
                 layer, sc = _best_layer_for_outfit(
                     compat_layers,
                     piece=base,
@@ -4662,16 +4720,16 @@ async def quickpair(
 
         elif base.get("categoria") == "topBase":
             for b in (bottom if len(bottom) <= 25 else rnd.sample(bottom, 25)):
-                if not are_compatible(base.get("colore"), b.get("colore")) and rnd.random() < 0.65:
+                if not are_compatible(_color_for_compat(base), _color_for_compat(b)) and rnd.random() < 0.65:
                     continue
 
                 compat_l = [
                     l for l in topLayer
-                    if are_compatible(l.get("colore"), base.get("colore"))
-                    or are_compatible(l.get("colore"), b.get("colore"))
+                    if are_compatible(_color_for_compat(l), _color_for_compat(base))
+                    or are_compatible(_color_for_compat(l), _color_for_compat(b))
                 ]
 
-                compat_s = [s for s in scarpe if are_compatible(b.get("colore"), s.get("colore"))] or scarpe
+                compat_s = [s for s in scarpe if are_compatible(_color_for_compat(b), _color_for_compat(s))] or scarpe
 
                 def _pre_shoe_topbase(shoe):
                     return outfit_score(
@@ -4709,16 +4767,16 @@ async def quickpair(
 
         elif base.get("categoria") == "bottom":
             for t in (topBase if len(topBase) <= 25 else rnd.sample(topBase, 25)):
-                if not are_compatible(t.get("colore"), base.get("colore")) and rnd.random() < 0.65:
+                if not are_compatible(_color_for_compat(t), _color_for_compat(base)) and rnd.random() < 0.65:
                     continue
 
                 compat_l = [
                     l for l in topLayer
-                    if are_compatible(l.get("colore"), t.get("colore"))
-                    or are_compatible(l.get("colore"), base.get("colore"))
+                    if are_compatible(_color_for_compat(l), _color_for_compat(t))
+                    or are_compatible(_color_for_compat(l), _color_for_compat(base))
                 ]
 
-                compat_s = [s for s in scarpe if are_compatible(base.get("colore"), s.get("colore"))] or scarpe
+                compat_s = [s for s in scarpe if are_compatible(_color_for_compat(base), _color_for_compat(s))] or scarpe
 
                 def _pre_shoe_bottom(shoe):
                     return outfit_score(
@@ -4757,12 +4815,12 @@ async def quickpair(
         elif base.get("categoria") == "scarpe":
             scarpe_pool = []
             for p in (pezzo if len(pezzo) <= 30 else rnd.sample(pezzo, 30)):
-                if not are_compatible(p.get("colore"), base.get("colore")):
+                if not are_compatible(_color_for_compat(p), _color_for_compat(base)):
                     continue
 
                 compat_layers = [
                     l for l in topLayer
-                    if are_compatible(p.get("colore"), l.get("colore"))
+                    if are_compatible(_color_for_compat(p), _color_for_compat(l))
                 ]
                 layer, sc = _best_layer_for_outfit(
                     compat_layers,
@@ -4787,15 +4845,15 @@ async def quickpair(
             for t in (topBase if len(topBase) <= 20 else rnd.sample(topBase, 20)):
                 for b in (bottom if len(bottom) <= 20 else rnd.sample(bottom, 20)):
                     if not (
-                        are_compatible(t.get("colore"), b.get("colore"))
-                        or are_compatible(b.get("colore"), base.get("colore"))
+                        are_compatible(_color_for_compat(t), _color_for_compat(b))
+                        or are_compatible(_color_for_compat(b), _color_for_compat(base))
                     ):
                         continue
 
                     compat_l = [
                         l for l in topLayer
-                        if are_compatible(l.get("colore"), t.get("colore"))
-                        or are_compatible(l.get("colore"), b.get("colore"))
+                        if are_compatible(_color_for_compat(l), _color_for_compat(t))
+                        or are_compatible(_color_for_compat(l), _color_for_compat(b))
                     ]
                     layer, sc = _best_layer_for_outfit(
                         compat_l,
@@ -4825,7 +4883,7 @@ async def quickpair(
         elif base.get("categoria") == "topLayer":
             for t in (topBase if len(topBase) <= 20 else rnd.sample(topBase, 20)):
                 for b in (bottom if len(bottom) <= 20 else rnd.sample(bottom, 20)):
-                    compat_s = [s for s in scarpe if are_compatible(b.get("colore"), s.get("colore"))] or scarpe
+                    compat_s = [s for s in scarpe if are_compatible(_color_for_compat(b), _color_for_compat(s))] or scarpe
 
                     def _pre_shoe_tl_tb(shoe):
                         return outfit_score(
@@ -4863,7 +4921,7 @@ async def quickpair(
                         )
 
             for p in (pezzo if len(pezzo) <= 25 else rnd.sample(pezzo, 25)):
-                compat_s = [s for s in scarpe if are_compatible(p.get("colore"), s.get("colore"))] or scarpe
+                compat_s = [s for s in scarpe if are_compatible(_color_for_compat(p), _color_for_compat(s))] or scarpe
 
                 def _pre_shoe_tl_piece(shoe):
                     return outfit_score(
