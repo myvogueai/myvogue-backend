@@ -4110,7 +4110,319 @@ def safe_gpt_text(prompt: str, max_tokens: int = 120, temperature: float = 0.8, 
         print(f"[safe_gpt_text ERROR] {e}")
         return None
 
-    # ------------------------------
+
+# ------------------------------
+# QuickPair ×3 — helper selezione varianti (solo /quickpair)
+# ------------------------------
+_QUICKPAIR_VARIANT_AXES = ("safe", "creative", "elegant")
+_QUICKPAIR_TOP_N_SINGLE = 3
+_QUICKPAIR_TOP_N_VARIANTS = 15
+_QUICKPAIR_OVERLAP_PENALTY = 0.4
+
+_QP_FORMAL_SHOE_KW = (
+    "mocassino", "mocassini", "loafer", "loafers", "derby", "oxford",
+    "stringata", "stringate", "francesina", "tacco", "decollete", "décolleté",
+)
+_QP_STREET_SHOE_KW = (
+    "sneaker", "sneakers", "trainer", "running", "track", "basket", "skate",
+)
+
+
+def _qp_cand_to_outfit_parts(cand: dict) -> dict:
+    return {
+        "pezzoUnico": cand.get("piece"),
+        "top": cand.get("top"),
+        "bottom": cand.get("bottom"),
+        "layer": cand.get("layer"),
+        "shoes": cand.get("shoes"),
+    }
+
+
+def _qp_item_id(it) -> str:
+    if not it:
+        return "-"
+    return str(it.get("docId") or it.get("id") or "-")
+
+
+def _qp_candidate_sig(cand: dict) -> tuple:
+    return _sig(_qp_cand_to_outfit_parts(cand))
+
+
+def _qp_slots_differ(cand_a: dict, cand_b: dict) -> bool:
+    """Almeno uno tra bottom, shoes, layer differisce."""
+    for key in ("bottom", "shoes", "layer"):
+        if _qp_item_id(cand_a.get(key)) != _qp_item_id(cand_b.get(key)):
+            return True
+    return False
+
+
+def _qp_overlap_count(cand_a: dict, cand_b: dict) -> int:
+    shared = 0
+    for key in ("top", "bottom", "piece", "layer", "shoes"):
+        ia = _qp_item_id(cand_a.get(key))
+        ib = _qp_item_id(cand_b.get(key))
+        if ia != "-" and ib != "-" and ia == ib:
+            shared += 1
+    return shared
+
+
+def _qp_dedupe_candidates(pool: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
+    seen: set[tuple] = set()
+    out: list[tuple[float, dict]] = []
+    for sc, cand in sorted(pool, key=lambda x: x[0], reverse=True):
+        sig = _qp_candidate_sig(cand)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append((sc, cand))
+    return out
+
+
+def _qp_variant_axis_score(
+    cand: dict,
+    axis: str,
+    base_sc: float,
+    stile_l: str,
+    occasion_n: str | None,
+) -> float:
+    """Aggiustamento locale per asse variante; non modifica outfit_score."""
+    parts = _qp_cand_to_outfit_parts(cand)
+    colors, _ = _collect_outfit_colors_and_items(parts)
+    neutrals = {"nero", "bianco", "grigio", "beige", "avorio", "marrone", "crema", "cammello"}
+    accents = {
+        "rosso", "rosa", "lilla", "verde", "oliva", "giallo", "senape",
+        "arancione", "bordeaux", "azzurro", "blu", "fucsia",
+    }
+    neutral_count = sum(1 for c in colors if c in neutrals)
+    accent_count = sum(1 for c in colors if c in accents)
+    layer = cand.get("layer")
+    shoes = cand.get("shoes")
+    bonus = 0.0
+
+    if axis == "safe":
+        if accent_count == 0:
+            bonus += 0.35
+        elif accent_count == 1 and neutral_count >= 2:
+            bonus += 0.2
+        if accent_count >= 3:
+            bonus -= 0.5
+        if layer is None:
+            bonus += 0.1
+    elif axis == "creative":
+        bonus += _score_visual_balance(
+            top=cand.get("top"),
+            bottom=cand.get("bottom"),
+            piece=cand.get("piece"),
+            shoes=shoes,
+            layer=layer,
+            target_style=stile_l,
+        ) * 0.35
+        if accent_count == 1 and neutral_count >= 1:
+            bonus += 0.35
+        if accent_count >= 2:
+            bonus += 0.2
+        if layer:
+            bonus += 0.25
+    elif axis == "elegant":
+        occ = occasion_n if occasion_n in {"elegant", "work", "evening"} else "elegant"
+        bonus += _score_occasion_fit(
+            top=cand.get("top"),
+            bottom=cand.get("bottom"),
+            piece=cand.get("piece"),
+            layer=layer,
+            shoes=shoes,
+            occasion=occ,
+        )
+        shoe_nm = str((shoes or {}).get("nome") or "").lower()
+        layer_nm = str((layer or {}).get("nome") or "").lower()
+        if any(k in shoe_nm for k in _QP_FORMAL_SHOE_KW):
+            bonus += 0.45
+        if layer and any(k in layer_nm for k in ("blazer", "giacca", "soprabito", "cappotto", "trench")):
+            bonus += 0.35
+        if any(k in shoe_nm for k in _QP_STREET_SHOE_KW):
+            bonus -= 0.35
+
+    return base_sc + bonus
+
+
+def _qp_pick_variants(
+    pool: list[tuple[float, dict]],
+    *,
+    variant_count: int,
+    stile_l: str,
+    occasion_n: str | None,
+) -> list[tuple[str, float, dict]]:
+    """Seleziona fino a variant_count varianti distinte (safe → creative → elegant)."""
+    axes = list(_QUICKPAIR_VARIANT_AXES)[: max(1, min(variant_count, len(_QUICKPAIR_VARIANT_AXES)))]
+    deduped = _qp_dedupe_candidates(pool)
+    if not deduped:
+        return []
+
+    chosen: list[tuple[str, float, dict]] = []
+    used_sigs: set[tuple] = set()
+
+    for axis in axes:
+        scored: list[tuple[float, float, dict, tuple, bool]] = []
+        for base_sc, cand in deduped:
+            sig = _qp_candidate_sig(cand)
+            if sig in used_sigs:
+                continue
+            axis_sc = _qp_variant_axis_score(cand, axis, base_sc, stile_l, occasion_n)
+            overlap_pen = sum(
+                _QUICKPAIR_OVERLAP_PENALTY * _qp_overlap_count(cand, prev)
+                for _, _, prev in chosen
+            )
+            adj = axis_sc - overlap_pen
+            diverse = not chosen or any(_qp_slots_differ(cand, prev) for _, _, prev in chosen)
+            scored.append((adj, base_sc, cand, sig, diverse))
+
+        if not scored:
+            break
+
+        diverse_pool = [row for row in scored if row[4]]
+        pick_from = diverse_pool if diverse_pool else scored
+        pick_from.sort(key=lambda x: x[0], reverse=True)
+        adj, _base_sc, cand, sig, _ = pick_from[0]
+        chosen.append((axis, adj, cand))
+        used_sigs.add(sig)
+
+    return chosen
+
+
+def _qp_variant_reason_prefix(variant: str, lang: str) -> str:
+    lc = (lang or "it").lower()
+    if lc.startswith("en"):
+        labels = {
+            "safe": "Safe pick: ",
+            "creative": "Creative angle: ",
+            "elegant": "More polished: ",
+        }
+    elif lc.startswith("es"):
+        labels = {
+            "safe": "Opción segura: ",
+            "creative": "Toque creativo: ",
+            "elegant": "Más elegante: ",
+        }
+    else:
+        labels = {
+            "safe": "Opzione sicura: ",
+            "creative": "Tocco creativo: ",
+            "elegant": "Più elegante: ",
+        }
+    return labels.get(variant, "")
+
+
+def _qp_build_variant_entry(
+    cand: dict,
+    selected_score: float,
+    *,
+    base: dict,
+    base_cat: str,
+    lang: str,
+    stile_l: str,
+    variant: str | None = None,
+) -> dict:
+    """Costruisce suggestion + immagini + descrizione per un candidato QuickPair."""
+    parts: list[str] = []
+
+    def _fmt(it):
+        if not it:
+            return ""
+        n = (it.get("nome") or "").strip()
+        c = normalize_color(it.get("colore"))
+        return f"{n} {c}".strip()
+
+    slim_base = _slim(base)
+    slim_top = _slim(cand.get("top"))
+    slim_bottom = _slim(cand.get("bottom"))
+    slim_piece = _slim(cand.get("piece"))
+    slim_layer = _slim(cand.get("layer"))
+    slim_shoes = _slim(cand.get("shoes"))
+
+    if slim_top and slim_top["id"] == slim_base["id"]:
+        slim_top = None
+    if slim_bottom and slim_bottom["id"] == slim_base["id"]:
+        slim_bottom = None
+    if slim_piece and slim_piece["id"] == slim_base["id"]:
+        slim_piece = None
+    if slim_layer and slim_layer["id"] == slim_base["id"]:
+        slim_layer = None
+    if slim_shoes and slim_shoes["id"] == slim_base["id"]:
+        slim_shoes = None
+
+    if base_cat == "topBase":
+        slim_top = slim_base
+    elif base_cat == "topLayer":
+        slim_layer = slim_base
+    elif base_cat == "bottom":
+        slim_bottom = slim_base
+    elif base_cat == "scarpe":
+        slim_shoes = slim_base
+    elif base_cat == "pezzoUnico":
+        slim_piece = slim_base
+
+    entry = {
+        "suggestion": {
+            "top": slim_top,
+            "bottom": slim_bottom,
+            "piece": slim_piece,
+            "layer": slim_layer,
+            "shoes": slim_shoes,
+        },
+        "score": selected_score,
+    }
+    if variant:
+        entry["variant"] = variant
+
+    if slim_piece:
+        entry["pezzoUnicoImage"] = slim_piece["imageUrl"]
+        entry["topImage"] = None
+        entry["bottomImage"] = None
+        parts.append("pezzo unico: " + _fmt(cand.get("piece")))
+    else:
+        if slim_top:
+            entry["topImage"] = slim_top["imageUrl"]
+            parts.append("top: " + _fmt(cand.get("top")))
+        else:
+            entry["topImage"] = None
+        if slim_bottom:
+            entry["bottomImage"] = slim_bottom["imageUrl"]
+            parts.append("bottom: " + _fmt(cand.get("bottom")))
+        else:
+            entry["bottomImage"] = None
+        entry["pezzoUnicoImage"] = None
+
+    if slim_layer:
+        entry["topLayerImage"] = slim_layer["imageUrl"]
+        parts.append("strato: " + _fmt(cand.get("layer")))
+    else:
+        entry["topLayerImage"] = None
+
+    if slim_shoes:
+        entry["scarpeImage"] = slim_shoes["imageUrl"]
+        parts.append("scarpe: " + _fmt(cand.get("shoes")))
+    else:
+        entry["scarpeImage"] = None
+
+    entry["descrizione"] = fallback_description([p for p in parts if p], lang)
+
+    outfit_for_log = _qp_cand_to_outfit_parts(cand)
+    reason = _build_styling_reason(
+        outfit_for_log,
+        target_style=stile_l,
+        lang=lang,
+        base_item=base,
+    )
+    if variant:
+        prefix = _qp_variant_reason_prefix(variant, lang)
+        if prefix and not reason.lower().startswith(prefix.strip().lower()[:-2]):
+            reason = prefix + reason
+    entry["stylingReason"] = reason
+    entry["_outfit_for_log"] = outfit_for_log
+    return entry
+
+
+# ------------------------------
 # 13-bis) /quickpair — Suggerimento PRO (Premium) dato un capo base
 # ------------------------------
 @app.get("/quickpair")
@@ -4123,6 +4435,12 @@ async def quickpair(
     occasion: str = Query(
         "",
         description="Optional context (TODO: Flutter UI): everyday|work|evening|elegant|casual|rainy|cold|warm.",
+    ),
+    variants: int = Query(
+        1,
+        ge=1,
+        le=3,
+        description="1=single (default, backward-compatible); 3=Premium safe/creative/elegant.",
     ),
 ):
     require_uid_match(request, userId)
@@ -4138,12 +4456,23 @@ async def quickpair(
             udata = udoc.to_dict() or {}
             is_premium = bool(udata.get("isPremium", False))
 
+        if variants == 3 and not is_premium:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PREMIUM_REQUIRED",
+                    "message": "QuickPair con 3 varianti è disponibile solo per utenti Premium.",
+                },
+            )
+
         if not is_premium:
             _quota = check_and_increment_quota_or_raise(
                 userId=userId,
                 feature="quickpair",
                 limit_free=QUICKPAIR_FREE_DAILY_LIMIT
             )
+
+        multi_variant = variants > 1 and is_premium
 
         # 2) Carica capo base
         bdoc = db.collection("clothingItems").document(baseId).get()
@@ -4270,7 +4599,7 @@ async def quickpair(
                 }
             )
 
-        _TOP_N = 3
+        _TOP_N = _QUICKPAIR_TOP_N_VARIANTS if multi_variant else _QUICKPAIR_TOP_N_SINGLE
         _SCORE_MARGIN = 1.5
         _QUICKPAIR_DOMINANCE_GAP = 0.38
         top_candidates = []   # list of (score, candidate), sorted desc, max _TOP_N elements
@@ -4574,6 +4903,83 @@ async def quickpair(
         # Filtra per margine qualità: scarta candidati troppo distanti dal top
         filtered = [(s, c) for s, c in top_candidates if s >= best_score - _SCORE_MARGIN]
 
+        if multi_variant:
+            picked = _qp_pick_variants(
+                filtered,
+                variant_count=variants,
+                stile_l=stile_l,
+                occasion_n=occasion_n,
+            )
+            if not picked:
+                print("quickpair nessuna variante trovata")
+                return JSONResponse(
+                    content={"error": "Impossibile generare un outfit coerente.", "lang": lang}
+                )
+
+            variants_payload: list[dict] = []
+            for variant_name, v_score, cand in picked:
+                entry = _qp_build_variant_entry(
+                    cand,
+                    v_score,
+                    base=base,
+                    base_cat=base_cat,
+                    lang=lang,
+                    stile_l=stile_l,
+                    variant=variant_name,
+                )
+                outfit_for_log = entry.pop("_outfit_for_log")
+                sid_v = _log_outfit_suggestion_safe(
+                    user_id=userId,
+                    source="quickpair",
+                    outfit_parts=outfit_for_log,
+                    style=stile_l,
+                    season=stagione_l,
+                    is_premium=is_premium,
+                    base_item_id=baseId,
+                    base_category=base_cat,
+                    score=v_score,
+                )
+                if sid_v:
+                    entry["suggestionId"] = sid_v
+                variants_payload.append(entry)
+
+            primary = variants_payload[0]
+            selected_score = primary["score"]
+            selected_rank = 1
+            debug_reason = (
+                f"variants={variants};available={len(variants_payload)};"
+                f"same_style_pool;base_cat={base.get('categoria')};"
+                f"items={len(items)};best_score={best_score:.4f};"
+                f"topCandidates={len(filtered)};deduped={len(_qp_dedupe_candidates(filtered))}"
+            )
+
+            payload = {
+                "base": _slim(base),
+                "suggestion": primary["suggestion"],
+                "lang": lang,
+                "premium": is_premium,
+                "fallbackLevel": 0,
+                "score": selected_score,
+                "scores": {"outfit": selected_score},
+                "debugReason": debug_reason,
+                "variants": variants_payload,
+                "variantsAvailable": len(variants_payload),
+                "variantsRequested": variants,
+                "pezzoUnicoImage": primary.get("pezzoUnicoImage"),
+                "topImage": primary.get("topImage"),
+                "bottomImage": primary.get("bottomImage"),
+                "topLayerImage": primary.get("topLayerImage"),
+                "scarpeImage": primary.get("scarpeImage"),
+                "descrizione": primary.get("descrizione"),
+                "stylingReason": primary.get("stylingReason"),
+            }
+            if primary.get("suggestionId"):
+                payload["suggestionId"] = primary["suggestionId"]
+
+            print("quickpair variants trovate =", len(variants_payload))
+            print("quickpair best_score =", best_score)
+            return JSONResponse(content=payload)
+
         if len(filtered) == 1:
             selected_score, best = filtered[0]
             selected_rank = 1
@@ -4613,105 +5019,34 @@ async def quickpair(
         )
         scores_payload = {"outfit": selected_score}
 
-        parts = []
-
-        def _fmt(it):
-            if not it:
-                return ""
-            n = (it.get("nome") or "").strip()
-            c = normalize_color(it.get("colore"))
-            return f"{n} {c}".strip()
-
-        slim_base = _slim(base)
-        slim_top = _slim(best.get("top"))
-        slim_bottom = _slim(best.get("bottom"))
-        slim_piece = _slim(best.get("piece"))
-        slim_layer = _slim(best.get("layer"))
-        slim_shoes = _slim(best.get("shoes"))
-
-        if slim_top and slim_top["id"] == slim_base["id"]:
-            slim_top = None
-        if slim_bottom and slim_bottom["id"] == slim_base["id"]:
-            slim_bottom = None
-        if slim_piece and slim_piece["id"] == slim_base["id"]:
-            slim_piece = None
-        if slim_layer and slim_layer["id"] == slim_base["id"]:
-            slim_layer = None
-        if slim_shoes and slim_shoes["id"] == slim_base["id"]:
-            slim_shoes = None
-
-        # Il capo cliccato deve sempre comparire in suggestion nel campo corretto.
-        if base_cat == "topBase":
-            slim_top = slim_base
-        elif base_cat == "topLayer":
-            slim_layer = slim_base
-        elif base_cat == "bottom":
-            slim_bottom = slim_base
-        elif base_cat == "scarpe":
-            slim_shoes = slim_base
-        elif base_cat == "pezzoUnico":
-            slim_piece = slim_base
+        primary_entry = _qp_build_variant_entry(
+            best,
+            selected_score,
+            base=base,
+            base_cat=base_cat,
+            lang=lang,
+            stile_l=stile_l,
+            variant=None,
+        )
+        outfit_for_log = primary_entry.pop("_outfit_for_log")
 
         payload = {
-            "base": slim_base,
-            "suggestion": {
-                "top": slim_top,
-                "bottom": slim_bottom,
-                "piece": slim_piece,
-                "layer": slim_layer,
-                "shoes": slim_shoes,
-            },
+            "base": _slim(base),
+            "suggestion": primary_entry["suggestion"],
             "lang": lang,
             "premium": is_premium,
             "fallbackLevel": fallback_level,
             "score": selected_score,
             "scores": scores_payload,
             "debugReason": debug_reason,
+            "pezzoUnicoImage": primary_entry.get("pezzoUnicoImage"),
+            "topImage": primary_entry.get("topImage"),
+            "bottomImage": primary_entry.get("bottomImage"),
+            "topLayerImage": primary_entry.get("topLayerImage"),
+            "scarpeImage": primary_entry.get("scarpeImage"),
+            "descrizione": primary_entry.get("descrizione"),
         }
 
-        scelta = {}
-        if slim_piece:
-            scelta["pezzoUnicoImage"] = slim_piece["imageUrl"]
-            scelta["topImage"] = None
-            scelta["bottomImage"] = None
-            parts.append("pezzo unico: " + _fmt(best.get("piece")))
-        else:
-            if slim_top:
-                scelta["topImage"] = slim_top["imageUrl"]
-                parts.append("top: " + _fmt(best.get("top")))
-            else:
-                scelta["topImage"] = None
-            if slim_bottom:
-                scelta["bottomImage"] = slim_bottom["imageUrl"]
-                parts.append("bottom: " + _fmt(best.get("bottom")))
-            else:
-                scelta["bottomImage"] = None
-            scelta["pezzoUnicoImage"] = None
-
-        if slim_layer:
-            scelta["topLayerImage"] = slim_layer["imageUrl"]
-            parts.append("strato: " + _fmt(best.get("layer")))
-        else:
-            scelta["topLayerImage"] = None
-
-        if slim_shoes:
-            scelta["scarpeImage"] = slim_shoes["imageUrl"]
-            parts.append("scarpe: " + _fmt(best.get("shoes")))
-        else:
-            scelta["scarpeImage"] = None
-
-        description = fallback_description([p for p in parts if p], lang)
-
-        payload.update(scelta)
-        payload["descrizione"] = description
-
-        outfit_for_log = {
-            "pezzoUnico": best.get("piece"),
-            "top": best.get("top"),
-            "bottom": best.get("bottom"),
-            "layer": best.get("layer"),
-            "shoes": best.get("shoes"),
-        }
         sid_qp = _log_outfit_suggestion_safe(
             user_id=userId,
             source="quickpair",
@@ -4726,12 +5061,7 @@ async def quickpair(
         if sid_qp:
             payload["suggestionId"] = sid_qp
 
-        payload["stylingReason"] = _build_styling_reason(
-            outfit_for_log,
-            target_style=stile_l,
-            lang=lang,
-            base_item=base,
-        )
+        payload["stylingReason"] = primary_entry.get("stylingReason")
 
         return JSONResponse(content=payload)
 
