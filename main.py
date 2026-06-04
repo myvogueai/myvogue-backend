@@ -4173,7 +4173,7 @@ def safe_gpt_text(prompt: str, max_tokens: int = 120, temperature: float = 0.8, 
 # QuickPair ×3 — helper selezione varianti (solo /quickpair)
 # ------------------------------
 _QUICKPAIR_VARIANT_AXES = ("safe", "creative", "elegant")
-_QUICKPAIR_TOP_N_SINGLE = 3
+_QUICKPAIR_TOP_N_SINGLE = 5
 _QUICKPAIR_TOP_N_VARIANTS = 15
 _QUICKPAIR_OVERLAP_PENALTY = 0.4
 
@@ -4200,6 +4200,81 @@ def _qp_item_id(it) -> str:
     if not it:
         return "-"
     return str(it.get("docId") or it.get("id") or "-")
+
+
+# TODO(temp): logging diagnostico QuickPair — rimuovere dopo analisi diversità
+def _qp_debug_log_top_candidates(top_candidates: list, *, limit: int = 10) -> None:
+    print("quickpair audit: top_candidates (by score, max %d):" % limit)
+    for rank, (sc, cand) in enumerate(
+        sorted(top_candidates, key=lambda x: x[0], reverse=True)[:limit],
+        start=1,
+    ):
+        bottom = cand.get("bottom")
+        shoes = cand.get("shoes")
+        print(
+            "  #%d score=%.4f bottom id=%s nome=%s | shoes id=%s nome=%s"
+            % (
+                rank,
+                sc,
+                _qp_item_id(bottom),
+                (bottom or {}).get("nome") or "-",
+                _qp_item_id(shoes),
+                (shoes or {}).get("nome") or "-",
+            )
+        )
+
+
+def _qp_debug_log_scores_summary(top_candidates: list, best_score: float) -> None:
+    _uniq = sorted({s for s, _ in top_candidates}, reverse=True)
+    print("quickpair audit: best_score=%.4f" % best_score)
+    if len(_uniq) >= 2:
+        print("quickpair audit: score_gap_first_second=%.4f" % (_uniq[0] - _uniq[1]))
+    else:
+        print("quickpair audit: score_gap_first_second=n/a")
+
+
+def _qp_debug_log_filtered(filtered: list) -> None:
+    print("quickpair audit: filtered_count=%d" % len(filtered))
+    print("quickpair audit: filtered (score + bottom):")
+    for sc, cand in filtered:
+        bottom = cand.get("bottom")
+        print(
+            "  score=%.4f bottom id=%s nome=%s"
+            % (sc, _qp_item_id(bottom), (bottom or {}).get("nome") or "-")
+        )
+
+
+def _qp_debug_selection_branch_label(filtered: list, dominance_gap: float) -> str:
+    if len(filtered) == 1:
+        return "single_filtered"
+    _uniq = sorted({s for s, _ in filtered}, reverse=True)
+    if len(_uniq) >= 2 and (_uniq[0] - _uniq[1]) >= dominance_gap:
+        return "dominance_gap_argmax"
+    return "weighted_random"
+
+
+def _qp_debug_log_selected(
+    branch: str,
+    selected_score: float,
+    cand: dict,
+    *,
+    selected_rank: int | None = None,
+) -> None:
+    bottom = cand.get("bottom")
+    shoes = cand.get("shoes")
+    rank_suffix = (" rank=%d" % selected_rank) if selected_rank is not None else ""
+    print("quickpair audit: selection_branch=%s%s" % (branch, rank_suffix))
+    print(
+        "quickpair audit: returned score=%.4f bottom id=%s nome=%s | shoes id=%s nome=%s"
+        % (
+            selected_score,
+            _qp_item_id(bottom),
+            (bottom or {}).get("nome") or "-",
+            _qp_item_id(shoes),
+            (shoes or {}).get("nome") or "-",
+        )
+    )
+    print("=== QUICKPAIR AUDIT END ===")
 
 
 def _qp_candidate_sig(cand: dict) -> tuple:
@@ -4973,6 +5048,11 @@ async def quickpair(
         # Filtra per margine qualità: scarta candidati troppo distanti dal top
         filtered = [(s, c) for s, c in top_candidates if s >= best_score - _SCORE_MARGIN]
 
+        print("=== QUICKPAIR AUDIT START baseId=%s multi_variant=%s ===" % (baseId, multi_variant))
+        _qp_debug_log_top_candidates(top_candidates, limit=10)
+        _qp_debug_log_scores_summary(top_candidates, best_score)
+        _qp_debug_log_filtered(filtered)
+
         if multi_variant:
             picked, pick_meta = _qp_pick_variants(
                 filtered,
@@ -5050,6 +5130,12 @@ async def quickpair(
             if primary.get("suggestionId"):
                 payload["suggestionId"] = primary["suggestionId"]
 
+            _qp_debug_log_selected(
+                "multi_variant_axes",
+                selected_score,
+                picked[0][2],
+                selected_rank=selected_rank,
+            )
             print("quickpair variants trovate =", len(variants_payload))
             print("quickpair best_score =", best_score)
             return JSONResponse(content=payload)
@@ -5074,6 +5160,12 @@ async def quickpair(
                 selected_score, best = filtered[_idx]
                 selected_rank = _idx + 1   # rank 1-based
 
+        _qp_debug_log_selected(
+            _qp_debug_selection_branch_label(filtered, _QUICKPAIR_DOMINANCE_GAP),
+            selected_score,
+            best,
+            selected_rank=selected_rank,
+        )
         print("quickpair best trovato = True")
         print("quickpair best_score =", best_score)
         print("quickpair selected_rank =", selected_rank, "of", len(filtered))
