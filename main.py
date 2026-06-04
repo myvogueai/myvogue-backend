@@ -5043,6 +5043,18 @@ async def quickpair(
                 content={"error": "Impossibile generare un outfit coerente.", "lang": lang}
             )
 
+        # topBase: al massimo un outfit per pantalone (miglior score per bottom_id)
+        if base_cat == "topBase":
+            _qp_by_bottom: dict[str, tuple[float, dict]] = {}
+            for sc, cand in top_candidates:
+                bid = _qp_item_id(cand.get("bottom"))
+                prev = _qp_by_bottom.get(bid)
+                if prev is None or sc > prev[0]:
+                    _qp_by_bottom[bid] = (sc, cand)
+            top_candidates = sorted(
+                _qp_by_bottom.values(), key=lambda x: x[0], reverse=True
+            )
+
         best_score = top_candidates[0][0]
 
         # Filtra per margine qualità: scarta candidati troppo distanti dal top
