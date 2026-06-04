@@ -4277,6 +4277,59 @@ def _qp_debug_log_selected(
     print("=== QUICKPAIR AUDIT END ===")
 
 
+# TODO(temp): audit score pantaloni durante enumerazione topBase
+def _qp_debug_bottom_score_record(
+    entries: list,
+    score: float,
+    cand: dict,
+) -> None:
+    bottom = cand.get("bottom")
+    shoes = cand.get("shoes")
+    bid = _qp_item_id(bottom)
+    bottom_nome = (bottom or {}).get("nome") or "-"
+    sid = _qp_item_id(shoes)
+    shoes_nome = (shoes or {}).get("nome") or "-"
+    entries.append({
+        "score": score,
+        "bottom_id": bid,
+        "bottom_nome": bottom_nome,
+        "shoes_id": sid,
+        "shoes_nome": shoes_nome,
+    })
+    print(
+        "quickpair bottom audit candidate: score=%.4f bottom_id=%s nome=%s | "
+        "shoes_id=%s nome=%s"
+        % (score, bid, bottom_nome, sid, shoes_nome)
+    )
+
+
+def _qp_debug_bottom_score_audit_summary(entries: list) -> None:
+    if not entries:
+        return
+    by_bottom: dict[str, dict] = {}
+    for e in entries:
+        bid = e["bottom_id"]
+        agg = by_bottom.get(bid)
+        if agg is None:
+            by_bottom[bid] = {
+                "bottom_nome": e["bottom_nome"],
+                "max_score": e["score"],
+                "candidate_count": 1,
+            }
+        else:
+            agg["candidate_count"] += 1
+            if e["score"] > agg["max_score"]:
+                agg["max_score"] = e["score"]
+    print("=== QUICKPAIR BOTTOM SCORE AUDIT ===")
+    for bid in sorted(by_bottom.keys()):
+        agg = by_bottom[bid]
+        print("bottom=%s nome=%s" % (bid, agg["bottom_nome"]))
+        print("max_score=%.2f" % agg["max_score"])
+        print("candidate_count=%d" % agg["candidate_count"])
+        print()
+    print("=== END QUICKPAIR BOTTOM SCORE AUDIT ===")
+
+
 def _qp_candidate_sig(cand: dict) -> tuple:
     return _sig(_qp_cand_to_outfit_parts(cand))
 
@@ -4748,6 +4801,7 @@ async def quickpair(
         _SCORE_MARGIN = 1.5
         _QUICKPAIR_DOMINANCE_GAP = 0.38
         top_candidates = []   # list of (score, candidate), sorted desc, max _TOP_N elements
+        _qp_bottom_score_audit: list = []
         rnd = random.Random(time.time())
 
         occasion_n = _normalize_quickpair_occasion((occasion or "").strip() or None)
@@ -4828,17 +4882,16 @@ async def quickpair(
                         base_item=base,
                     )
 
-                    _upd(
-                        {
-                            "base": base,
-                            "top": base,
-                            "bottom": b,
-                            "layer": layer,
-                            "shoes": sh,
-                            "piece": None
-                        },
-                        sc
-                    )
+                    _cand_tb = {
+                        "base": base,
+                        "top": base,
+                        "bottom": b,
+                        "layer": layer,
+                        "shoes": sh,
+                        "piece": None,
+                    }
+                    _qp_debug_bottom_score_record(_qp_bottom_score_audit, sc, _cand_tb)
+                    _upd(_cand_tb, sc)
 
         elif base.get("categoria") == "bottom":
             for t in (topBase if len(topBase) <= 25 else rnd.sample(topBase, 25)):
@@ -5036,6 +5089,9 @@ async def quickpair(
                 status_code=400,
                 detail={"code": "UNSUPPORTED_CATEGORY", "message": "Categoria del capo base non gestita."}
             )
+
+        if base_cat == "topBase":
+            _qp_debug_bottom_score_audit_summary(_qp_bottom_score_audit)
 
         if not top_candidates:
             print("quickpair nessun best trovato")
