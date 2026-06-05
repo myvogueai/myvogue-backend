@@ -4823,7 +4823,7 @@ async def quickpair(
             )
 
         _TOP_N = _QUICKPAIR_TOP_N_VARIANTS if multi_variant else _QUICKPAIR_TOP_N_SINGLE
-        _SCORE_MARGIN = 1.5
+        _SCORE_MARGIN = 2.0
         _QUICKPAIR_DOMINANCE_GAP = 0.38
         top_candidates = []   # list of (score, candidate), sorted desc, max _TOP_N elements
         _qp_bottom_score_audit: list = []
