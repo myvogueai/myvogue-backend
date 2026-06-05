@@ -4648,6 +4648,10 @@ async def quickpair(
         "best",
         description="best=dominance gap then weighted random (default); explore=always weighted random on filtered pool.",
     ),
+    excludeBottomIds: str = Query(
+        "",
+        description="comma-separated bottom ids to skip when selection=explore; ignored for selection=best.",
+    ),
 ):
     require_uid_match(request, userId)
     try:
@@ -4657,6 +4661,12 @@ async def quickpair(
                 status_code=400,
                 detail={"code": "INVALID_SELECTION", "message": "selection must be best or explore."},
             )
+
+        exclude_bottom_set: set[str] = set()
+        if selection_l == "explore":
+            exclude_bottom_set = {
+                x.strip() for x in (excludeBottomIds or "").split(",") if x.strip()
+            }
 
         stagione_l = normalize_stagione(stagione)
         lang = (lang or get_user_lang(userId, "it")).lower()
@@ -5153,6 +5163,18 @@ async def quickpair(
         # Filtra per margine qualità: scarta candidati troppo distanti dal top
         filtered = [(s, c) for s, c in top_candidates if s >= best_score - _SCORE_MARGIN]
 
+        pool_for_selection = filtered
+        explore_exclude_fallback = False
+        if selection_l == "explore" and exclude_bottom_set:
+            narrowed = [
+                (s, c) for s, c in filtered
+                if _qp_item_id(c.get("bottom")) not in exclude_bottom_set
+            ]
+            if narrowed:
+                pool_for_selection = narrowed
+            else:
+                explore_exclude_fallback = True
+
         print("=== QUICKPAIR AUDIT START baseId=%s multi_variant=%s ===" % (baseId, multi_variant))
         _qp_debug_log_top_candidates(top_candidates, limit=10)
         _qp_debug_log_scores_summary(top_candidates, best_score)
@@ -5245,31 +5267,31 @@ async def quickpair(
             print("quickpair best_score =", best_score)
             return JSONResponse(content=payload)
 
-        if len(filtered) == 1:
-            selected_score, best = filtered[0]
+        if len(pool_for_selection) == 1:
+            selected_score, best = pool_for_selection[0]
             selected_rank = 1
         else:
             _use_dominance = selection_l != "explore"
-            _uniq = sorted({s for s, _ in filtered}, reverse=True)
+            _uniq = sorted({s for s, _ in pool_for_selection}, reverse=True)
             if (
                 _use_dominance
                 and len(_uniq) >= 2
                 and (_uniq[0] - _uniq[1]) >= _QUICKPAIR_DOMINANCE_GAP
             ):
-                selected_score, best = next((s, c) for s, c in filtered if s == _uniq[0])
+                selected_score, best = next((s, c) for s, c in pool_for_selection if s == _uniq[0])
                 selected_rank = 1
             else:
-                _sc  = [s for s, _ in filtered]
-                _can = [c for _, c in filtered]
+                _sc  = [s for s, _ in pool_for_selection]
+                _can = [c for _, c in pool_for_selection]
                 _min = min(_sc)
                 _w   = [s - _min + 0.1 for s in _sc]   # peso proporzionale, minimo 0.1
-                _idx = rnd.choices(range(len(filtered)), weights=_w, k=1)[0]
-                selected_score, best = filtered[_idx]
+                _idx = rnd.choices(range(len(pool_for_selection)), weights=_w, k=1)[0]
+                selected_score, best = pool_for_selection[_idx]
                 selected_rank = _idx + 1   # rank 1-based
 
         _qp_debug_log_selected(
             _qp_debug_selection_branch_label(
-                filtered,
+                pool_for_selection,
                 _QUICKPAIR_DOMINANCE_GAP,
                 selection=selection_l,
             ),
@@ -5279,7 +5301,7 @@ async def quickpair(
         )
         print("quickpair best trovato = True")
         print("quickpair best_score =", best_score)
-        print("quickpair selected_rank =", selected_rank, "of", len(filtered))
+        print("quickpair selected_rank =", selected_rank, "of", len(pool_for_selection))
         print("quickpair best payload =", {
             "top":    (best.get("top") or {}).get("nome"),
             "bottom": (best.get("bottom") or {}).get("nome"),
@@ -5292,7 +5314,9 @@ async def quickpair(
         debug_reason = (
             f"same_style_pool;base_cat={base.get('categoria')};"
             f"items={len(items)};best_score={best_score:.4f};"
-            f"topCandidates={len(filtered)};selectedRank={selected_rank};"
+            f"topCandidates={len(filtered)};explorePool={len(pool_for_selection)};"
+            f"exploreExcluded={len(exclude_bottom_set)};exploreExcludeFallback={int(explore_exclude_fallback)};"
+            f"selectedRank={selected_rank};"
             f"selection={selection_l}"
         )
         scores_payload = {"outfit": selected_score}
