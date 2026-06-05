@@ -4173,7 +4173,7 @@ def safe_gpt_text(prompt: str, max_tokens: int = 120, temperature: float = 0.8, 
 # QuickPair ×3 — helper selezione varianti (solo /quickpair)
 # ------------------------------
 _QUICKPAIR_VARIANT_AXES = ("safe", "creative", "elegant")
-_QUICKPAIR_TOP_N_SINGLE = 5
+_QUICKPAIR_TOP_N_SINGLE = 12
 _QUICKPAIR_TOP_N_VARIANTS = 15
 _QUICKPAIR_OVERLAP_PENALTY = 0.4
 
