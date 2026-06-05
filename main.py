@@ -5111,6 +5111,28 @@ async def quickpair(
                 _qp_by_bottom.values(), key=lambda x: x[0], reverse=True
             )
 
+        print("=== TOP CANDIDATES AFTER DEDUP ===")
+
+        for idx, candidate in enumerate(top_candidates, start=1):
+            try:
+                score = candidate[0]
+                cand = candidate[1]
+                bottom = cand.get("bottom")
+                shoes = cand.get("shoes")
+
+                print(
+                    f"#{idx} "
+                    f"score={score:.2f} "
+                    f"bottom_id={_qp_item_id(bottom)} "
+                    f"bottom_nome={(bottom or {}).get('nome') or '-'} "
+                    f"shoes_id={_qp_item_id(shoes)} "
+                    f"shoes_nome={(shoes or {}).get('nome') or '-'}"
+                )
+            except Exception as e:
+                print(f"LOG ERROR: {e}")
+
+        print("=== END TOP CANDIDATES AFTER DEDUP ===")
+
         best_score = top_candidates[0][0]
 
         # Filtra per margine qualità: scarta candidati troppo distanti dal top
