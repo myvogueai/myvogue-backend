@@ -4244,9 +4244,13 @@ def _qp_debug_log_filtered(filtered: list) -> None:
         )
 
 
-def _qp_debug_selection_branch_label(filtered: list, dominance_gap: float) -> str:
+def _qp_debug_selection_branch_label(
+    filtered: list, dominance_gap: float, *, selection: str = "best"
+) -> str:
     if len(filtered) == 1:
         return "single_filtered"
+    if selection == "explore":
+        return "explore_weighted_random"
     _uniq = sorted({s for s, _ in filtered}, reverse=True)
     if len(_uniq) >= 2 and (_uniq[0] - _uniq[1]) >= dominance_gap:
         return "dominance_gap_argmax"
@@ -4640,9 +4644,20 @@ async def quickpair(
         le=3,
         description="1=single (default, backward-compatible); 3=Premium safe/creative/elegant.",
     ),
+    selection: str = Query(
+        "best",
+        description="best=dominance gap then weighted random (default); explore=always weighted random on filtered pool.",
+    ),
 ):
     require_uid_match(request, userId)
     try:
+        selection_l = (selection or "best").strip().lower()
+        if selection_l not in ("best", "explore"):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_SELECTION", "message": "selection must be best or explore."},
+            )
+
         stagione_l = normalize_stagione(stagione)
         lang = (lang or get_user_lang(userId, "it")).lower()
         lang_name = LANG_NAME.get(lang, "italiano")
@@ -5234,9 +5249,11 @@ async def quickpair(
             selected_score, best = filtered[0]
             selected_rank = 1
         else:
+            _use_dominance = selection_l != "explore"
             _uniq = sorted({s for s, _ in filtered}, reverse=True)
             if (
-                len(_uniq) >= 2
+                _use_dominance
+                and len(_uniq) >= 2
                 and (_uniq[0] - _uniq[1]) >= _QUICKPAIR_DOMINANCE_GAP
             ):
                 selected_score, best = next((s, c) for s, c in filtered if s == _uniq[0])
@@ -5251,7 +5268,11 @@ async def quickpair(
                 selected_rank = _idx + 1   # rank 1-based
 
         _qp_debug_log_selected(
-            _qp_debug_selection_branch_label(filtered, _QUICKPAIR_DOMINANCE_GAP),
+            _qp_debug_selection_branch_label(
+                filtered,
+                _QUICKPAIR_DOMINANCE_GAP,
+                selection=selection_l,
+            ),
             selected_score,
             best,
             selected_rank=selected_rank,
@@ -5271,7 +5292,8 @@ async def quickpair(
         debug_reason = (
             f"same_style_pool;base_cat={base.get('categoria')};"
             f"items={len(items)};best_score={best_score:.4f};"
-            f"topCandidates={len(filtered)};selectedRank={selected_rank}"
+            f"topCandidates={len(filtered)};selectedRank={selected_rank};"
+            f"selection={selection_l}"
         )
         scores_payload = {"outfit": selected_score}
 
