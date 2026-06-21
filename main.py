@@ -3902,6 +3902,7 @@ async def genera_outfit(
                 scelta["descrizione"] = description
                 scelta["consiglioExtra"] = consiglio_extra
                 scelta["lang"] = lang
+                scelta["score"] = c.get("score")
                 sid = _log_outfit_suggestion_safe(
                     user_id=userId,
                     source="outfit",
@@ -4222,6 +4223,7 @@ async def genera_outfit(
                 "fallback": fb
             }
             payload["premium"] = False
+            payload["score"] = best_score
 
             sid_free = _log_outfit_suggestion_safe(
                 user_id=userId,
@@ -4250,7 +4252,7 @@ async def genera_outfit(
             # Compact mode per il ramo free (Punto 7 — facoltativo)
             if compact:
                 for k in list(payload.keys()):
-                    if k not in ("pezzoUnicoImage","topImage","bottomImage","topLayerImage","scarpeImage","descrizione","lang","freeDaily","premium","suggestionId","stylingReason"):
+                    if k not in ("pezzoUnicoImage","topImage","bottomImage","topLayerImage","scarpeImage","descrizione","lang","freeDaily","premium","suggestionId","stylingReason","score"):
                         payload.pop(k, None)
 
             write_cached_daily_outfit(userId, payload, meta)
