@@ -101,6 +101,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # Master switch: False disattiva le chiamate GPT negli endpoint (outfit AI-first, judge, helper testuali).
 USE_GPT = False
 
+# ---------------------------------------------------------------------------
+# Sandbox: GPT-4o Vision Fashion Judge sul Lookbook (solo sviluppatore).
+# True = attivo; mettere False prima del deploy.
+# Non ha effetti su quota, UX o percorso free.
+# ---------------------------------------------------------------------------
+USE_GPT_SANDBOX = False
+
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 FIREBASE_BUCKET = os.getenv("FIREBASE_BUCKET", "")
 
@@ -2826,6 +2833,164 @@ def _safe_id(x):  # accetta None o string
     return x if x else None
 
 
+# ---------------------------------------------------------------------------
+# GPT-4o Vision Sandbox — Lookbook fashion judge
+# Attivato da USE_GPT_SANDBOX. Nessun effetto sulla risposta, solo logging.
+# ---------------------------------------------------------------------------
+
+_SANDBOX_SYSTEM_PROMPT = (
+    "Sei uno stylist europeo premium. Questi outfit sono stati generati da un motore "
+    "automatico a partire dal guardaroba reale di una persona. Guarda le immagini reali dei capi. "
+    "Scegli e ordina gli outfit che una persona elegante e attenta allo stile indosserebbe davvero. "
+    "IMPORTANTE: puoi scegliere SOLO tra gli outfit e i capi mostrati nelle immagini — non inventare "
+    "capi che non ci sono, non suggerire alternative non presenti. "
+    "Penalizza: outfit banali, contrasti sgradevoli, scarpe incoerenti, look datati, mancanza di punto focale. "
+    "Premia: desiderabilità reale, equilibrio, modernità, armonia visiva. "
+    "Per ogni outfit scelto, spiega in una frase perché funziona, come farebbe uno stylist a un cliente."
+)
+
+
+def _sandbox_item_payload(item: dict | None) -> dict | None:
+    """Restituisce i campi rilevanti di un capo per il sandbox judge. Ritorna None se item è assente."""
+    if not item:
+        return None
+    return {
+        "imageUrl": item.get("imageUrl"),
+        "categoria": item.get("categoria"),
+        "colore": normalize_color(item.get("colore")),
+        "stile": item.get("stile"),
+        "nome": item.get("nome"),
+    }
+
+
+def _sandbox_gpt_judge(topK5: list[dict]) -> None:
+    """
+    Chiama GPT-4o vision sui top-5 candidati Lookbook (già ordinati dal motore deterministico).
+    Logga il ranking deterministico originale e il ranking GPT affiancati.
+    Non modifica topK5, non ha effetti collaterali sul flusso di risposta.
+    La chiave API viene letta da OPENAI_API_KEY (variabile d'ambiente).
+    """
+    sandbox_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not openai or not sandbox_key:
+        print("[SANDBOX] openai non disponibile o OPENAI_API_KEY assente — skip")
+        return
+    if not topK5:
+        return
+
+    # --- Log ranking deterministico ---
+    print("=== [SANDBOX] RANKING DETERMINISTICO (pre-GPT) ===")
+    for rank, c in enumerate(topK5, start=1):
+        o = c["outfit"]
+        parts = []
+        for slot in ("pezzoUnico", "top", "bottom", "layer", "shoes"):
+            item = o.get(slot)
+            if item:
+                nome = item.get("nome", "?")
+                colore = normalize_color(item.get("colore", "?"))
+                parts.append(f"{slot}={nome}({colore})")
+        print(f"  Det #{rank}  score={c['score']:.4f}  {' | '.join(parts)}")
+
+    # --- Costruzione payload visivo ---
+    # Testo introduttivo con descrizione testuale di ogni outfit
+    intro_lines = []
+    for idx, c in enumerate(topK5, start=1):
+        o = c["outfit"]
+        slot_descs = []
+        for slot_key, label in [
+            ("pezzoUnico", "Pezzo unico"),
+            ("top", "Top"),
+            ("bottom", "Bottom"),
+            ("layer", "Layer"),
+            ("shoes", "Scarpe"),
+        ]:
+            item = o.get(slot_key)
+            if not item:
+                continue
+            m = _sandbox_item_payload(item)
+            slot_descs.append(
+                f"{label}: {m['nome']} – {m['colore']} ({m['categoria']}, stile {m['stile']})"
+            )
+        intro_lines.append(f"Outfit {idx}: {'; '.join(slot_descs)}")
+
+    user_text = (
+        "Questi sono i 5 outfit candidati nell'ordine del motore deterministico.\n\n"
+        + "\n".join(intro_lines)
+        + "\n\nLe immagini seguono nello stesso ordine: per ogni outfit i capi sono mostrati "
+          "in sequenza (pezzo unico / top / bottom / layer / scarpe, solo quelli presenti).\n\n"
+          "Rispondi SOLO con un JSON valido, senza testo extra, nel formato:\n"
+          '{"ranking": [{"outfit": 1, "motivo": "..."}, {"outfit": 3, "motivo": "..."}, ...]}\n'
+          "Dal migliore al peggiore, includendo tutti e 5 gli outfit."
+    )
+
+    content: list = [{"type": "text", "text": user_text}]
+    for idx, c in enumerate(topK5, start=1):
+        o = c["outfit"]
+        content.append({"type": "text", "text": f"--- Outfit {idx} ---"})
+        for slot_key in ("pezzoUnico", "top", "bottom", "layer", "shoes"):
+            item = o.get(slot_key)
+            if not item:
+                continue
+            url = item.get("imageUrl")
+            if not url:
+                continue
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": url, "detail": "low"},
+            })
+
+    # --- Chiamata GPT-4o ---
+    try:
+        client = openai.OpenAI(api_key=sandbox_key)
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": _SANDBOX_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            max_tokens=500,
+            temperature=0.3,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        print(f"[SANDBOX] GPT-4o raw response: {raw}")
+
+        # Estrae il JSON dalla risposta (tollera markdown code block)
+        json_str = raw
+        if "```" in raw:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start != -1 and end > start:
+                json_str = raw[start:end]
+
+        data = json.loads(json_str)
+        ranking = data.get("ranking", [])
+
+        print("=== [SANDBOX] RANKING GPT-4o ===")
+        for pos, entry in enumerate(ranking, start=1):
+            outfit_n = entry.get("outfit")
+            motivo = entry.get("motivo", "")
+            if isinstance(outfit_n, int) and 1 <= outfit_n <= len(topK5):
+                det_score = topK5[outfit_n - 1]["score"]
+                score_str = f"(era det #{outfit_n}, score={det_score:.4f})"
+            else:
+                score_str = ""
+            print(f"  GPT #{pos} → Outfit {outfit_n} {score_str}: {motivo}")
+
+        print("=== [SANDBOX] CONFRONTO AFFIANCATO ===")
+        max_len = max(len(topK5), len(ranking))
+        for i in range(max_len):
+            det_label = f"Det #{i+1}: Outfit {i+1}" if i < len(topK5) else "Det: —"
+            if i < len(ranking):
+                ge = ranking[i]
+                gpt_label = f"GPT #{i+1}: Outfit {ge.get('outfit')} — {ge.get('motivo', '')}"
+            else:
+                gpt_label = "GPT: —"
+            print(f"  {det_label:<35} | {gpt_label}")
+        print("=== [SANDBOX] END ===")
+
+    except Exception as e:
+        print(f"[SANDBOX] GPT-4o ERROR: {type(e).__name__}: {e}")
+
+
 # ------------------------------
 # 11) FASTAPI setup
 # ------------------------------
@@ -3533,12 +3698,12 @@ async def genera_outfit(
             toplayer = avoid_recent(toplayer, recent_ids)
             pezzo    = avoid_recent(pezzo,    recent_ids)
 
-            # (Punto 4) escludi capi già mostrati in UI
-            topbase  = _exclude(topbase,  exclude_set)
-            toplayer = _exclude(toplayer, exclude_set)
-            bottom   = _exclude(bottom,   exclude_set)
-            scarpe   = _exclude(scarpe,   exclude_set)
-            pezzo    = _exclude(pezzo,    exclude_set)
+            # (Punto 4) escludi capi già mostrati in UI — soft: fallback per categoria se l'esclusione azzera il pool
+            topbase  = _exclude(topbase,  exclude_set) or topbase
+            toplayer = _exclude(toplayer, exclude_set) or toplayer
+            bottom   = _exclude(bottom,   exclude_set) or bottom
+            scarpe   = _exclude(scarpe,   exclude_set) or scarpe
+            pezzo    = _exclude(pezzo,    exclude_set) or pezzo
 
             # Seed deterministico (Punto 5)
             seed_material = refreshSeed or str(time.time())
@@ -3646,6 +3811,16 @@ async def genera_outfit(
                     break
 
             topK = dedup
+
+            # ---- SANDBOX AI FASHION JUDGE (solo dev — USE_GPT_SANDBOX) ------
+            # Intercetta i top-5 candidati prima della presentazione finale.
+            # Nessun effetto su topK, quota, UX o percorso free.
+            if USE_GPT_SANDBOX and topK:
+                try:
+                    _sandbox_gpt_judge(topK[:5])
+                except Exception as _sb_exc:
+                    print(f"[SANDBOX] uncaught error: {_sb_exc}")
+            # ------------------------------------------------------------------
 
             if not topK:
                 return JSONResponse(
@@ -3884,12 +4059,12 @@ async def genera_outfit(
             toplayer = avoid_recent(toplayer, recent_ids)
             pezzo    = avoid_recent(pezzo,    recent_ids)
 
-            # (Punto 4) escludi capi già mostrati in UI
-            topbase  = _exclude(topbase,  exclude_set)
-            toplayer = _exclude(toplayer, exclude_set)
-            bottom   = _exclude(bottom,   exclude_set)
-            scarpe   = _exclude(scarpe,   exclude_set)
-            pezzo    = _exclude(pezzo,    exclude_set)
+            # (Punto 4) escludi capi già mostrati in UI — soft: fallback per categoria se l'esclusione azzera il pool
+            topbase  = _exclude(topbase,  exclude_set) or topbase
+            toplayer = _exclude(toplayer, exclude_set) or toplayer
+            bottom   = _exclude(bottom,   exclude_set) or bottom
+            scarpe   = _exclude(scarpe,   exclude_set) or scarpe
+            pezzo    = _exclude(pezzo,    exclude_set) or pezzo
 
             # Seed deterministico (Punto 5)
             seed_material = refreshSeed or str(time.time())
