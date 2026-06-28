@@ -56,6 +56,10 @@ def normalize_stagione(s: str | None) -> str:
     return str(s).strip().lower()
 
 
+def _is_estate_context(season: str | None) -> bool:
+    return bool(season) and normalize_stagione(season) == "estate"
+
+
 def _firestore_json_scalar(v):
     """Converte valori Firestore (datetime/Timestamp-like) in forma JSON-safe."""
     if v is None:
@@ -851,7 +855,7 @@ def _score_real_shoes(shoes_item, target_style):
     return score
 
 
-def _score_real_toplayer(top_layer_item, target_style):
+def _score_real_toplayer(top_layer_item, target_style, target_season=None):
     if not top_layer_item:
         return 0.0
 
@@ -899,6 +903,8 @@ def _score_real_toplayer(top_layer_item, target_style):
     ) and any(k in text for k in ("giacca", "jacket", "giubb", "giubbotto")):
         score += 0.12
 
+    if _is_estate_context(target_season):
+        score = min(score, 0.5)
     return score
 
 
@@ -981,7 +987,15 @@ def _score_shoes_layer_combo(shoes_item, top_layer_item, target_style):
 
     return score
 
-def _score_visual_balance(top=None, bottom=None, piece=None, shoes=None, layer=None, target_style=None):
+def _score_visual_balance(
+    top=None,
+    bottom=None,
+    piece=None,
+    shoes=None,
+    layer=None,
+    target_style=None,
+    target_season=None,
+):
     """
     Bonus/malus per rendere il look più premium:
     - evita outfit piatti o tutti uguali
@@ -1027,14 +1041,14 @@ def _score_visual_balance(top=None, bottom=None, piece=None, shoes=None, layer=N
     if len(set(colors)) >= 4:
         score -= 1.4
 
-    if layer:
+    if layer and not _is_estate_context(target_season):
         if piece:
             score += 0.4
         elif top and bottom:
             score += 0.8
 
     if style in {"streetwear", "casual", "elegante"}:
-        if top and bottom and not layer:
+        if top and bottom and not layer and not _is_estate_context(target_season):
             score -= 0.3
 
     if len(set(colors)) == 1:
@@ -2472,6 +2486,7 @@ def outfit_score(
     layer=None,
     prefer_palette: list[str] | None = None,
     target_style: str | None = None,
+    target_season: str | None = None,
     base_item: dict | None = None,
     apply_archetype: bool = True,
 ):
@@ -2529,7 +2544,7 @@ def outfit_score(
 
     if style_eff:
         score += _score_real_shoes(shoes, style_eff)
-        score += _score_real_toplayer(layer, style_eff)
+        score += _score_real_toplayer(layer, style_eff, target_season)
         score += _score_shoes_layer_combo(shoes, layer, style_eff)
         score += _light_formality_tune(shoes, layer, style_eff)
 
@@ -2539,7 +2554,8 @@ def outfit_score(
         piece=piece,
         shoes=shoes,
         layer=layer,
-        target_style=style_eff
+        target_style=style_eff,
+        target_season=target_season,
     )
 
     score += _score_base_item_fit(
@@ -2570,6 +2586,7 @@ def outfit_score(
 
 
 _LAYER_MIN_GAIN = 0.08
+_LAYER_MIN_GAIN_ESTATE = 0.65
 
 
 def _best_layer_for_outfit(
@@ -2581,6 +2598,7 @@ def _best_layer_for_outfit(
     shoes=None,
     prefer_palette: list[str] | None = None,
     target_style: str | None = None,
+    target_season: str | None = None,
     base_item: dict | None = None,
 ):
     base_sc = outfit_score(
@@ -2591,6 +2609,7 @@ def _best_layer_for_outfit(
         layer=None,
         prefer_palette=prefer_palette,
         target_style=target_style,
+        target_season=target_season,
         base_item=base_item,
         apply_archetype=True,
     )
@@ -2607,13 +2626,19 @@ def _best_layer_for_outfit(
             layer=lyr,
             prefer_palette=prefer_palette,
             target_style=target_style,
+            target_season=target_season,
             base_item=base_item,
             apply_archetype=True,
         )
         if sc > best_sc:
             best_sc = sc
             best_layer = lyr
-    if best_layer is not None and best_sc >= base_sc + _LAYER_MIN_GAIN:
+    min_gain = (
+        _LAYER_MIN_GAIN_ESTATE
+        if _is_estate_context(target_season)
+        else _LAYER_MIN_GAIN
+    )
+    if best_layer is not None and best_sc >= base_sc + min_gain:
         return best_layer, best_sc
     return None, base_sc
 
@@ -3728,6 +3753,7 @@ async def genera_outfit(
                             shoes=sh,
                             prefer_palette=prefer_palette,
                             target_style=stile_l_req,
+                            target_season=stagione_l,
                         )
                         candidati.append({
                             "score": score,
@@ -3783,6 +3809,7 @@ async def genera_outfit(
                             shoes=sh,
                             prefer_palette=prefer_palette,
                             target_style=stile_l_req,
+                            target_season=stagione_l,
                         )
 
                         candidati.append({
@@ -4090,6 +4117,7 @@ async def genera_outfit(
                             shoes=sh,
                             prefer_palette=prefer_palette,
                             target_style=stile_l,
+                            target_season=stagione_l,
                         )
 
                         if score > best_score:
@@ -4143,6 +4171,7 @@ async def genera_outfit(
                             shoes=sh,
                             prefer_palette=prefer_palette,
                             target_style=stile_l,
+                            target_season=stagione_l,
                         )
 
                         if score > best_score:
@@ -5045,6 +5074,7 @@ async def quickpair(
                     piece=base,
                     shoes=sh,
                     target_style=stile_l,
+                    target_season=stagione_l,
                     base_item=base,
                 )
                 _upd({"base": base, "piece": base, "layer": layer, "shoes": sh, "top": None, "bottom": None}, sc)
@@ -5081,6 +5111,7 @@ async def quickpair(
                         bottom=b,
                         shoes=sh,
                         target_style=stile_l,
+                        target_season=stagione_l,
                         base_item=base,
                     )
 
@@ -5127,6 +5158,7 @@ async def quickpair(
                         bottom=base,
                         shoes=sh,
                         target_style=stile_l,
+                        target_season=stagione_l,
                         base_item=base,
                     )
 
@@ -5157,6 +5189,7 @@ async def quickpair(
                     piece=p,
                     shoes=base,
                     target_style=stile_l,
+                    target_season=stagione_l,
                     base_item=base,
                 )
 
@@ -5191,6 +5224,7 @@ async def quickpair(
                         bottom=b,
                         shoes=base,
                         target_style=stile_l,
+                        target_season=stagione_l,
                         base_item=base,
                     )
 
