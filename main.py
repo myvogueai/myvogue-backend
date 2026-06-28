@@ -5650,7 +5650,6 @@ async def quickpair(
         raise
     except Exception as e:
         print(f"[QUICKPAIR ERROR] type={type(e).__name__} msg={e}")
-        traceback.print_exc()
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 # ------------------------------
